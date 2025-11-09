@@ -2,17 +2,21 @@ import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3
 import { getContactInfoForHandle, getContactNameForHandle, normalizeHandleIdentifier } from "../contacts";
 import { getDatabase } from "./db";
 import { fromAppleTimestamp, toAppleTimestamp } from "./dates";
-import type {
-  ChatParticipantStats,
-  ChatReactionParticipantStats,
-  ChatSummary,
-  ConversationStats,
-  DailyCount,
-  HourlyCount,
-  ReactionTotals,
-  SearchOptions,
-  SearchResultMessage,
-  WeekdayCount,
+import {
+  type AttachmentStats,
+  REACTION_TYPES,
+  type ChatParticipantStats,
+  type ChatReactionParticipantStats,
+  type ChatSummary,
+  type ConversationStats,
+  type DailyCount,
+  type HourlyCount,
+  type ReactionCountSummary,
+  type ReactionTotals,
+  type ReactionType,
+  type SearchOptions,
+  type SearchResultMessage,
+  type WeekdayCount,
 } from "./types";
 
 let cachedFtsSupport: boolean | null = null;
@@ -23,6 +27,7 @@ type ReactionColumnSupport = {
   hasAssociatedType: boolean;
 } | null;
 let cachedReactionColumnSupport: ReactionColumnSupport = null;
+let cachedAttachmentSupport: boolean | null = null;
 
 function detectFtsSupport(db: BetterSqliteDatabase): boolean {
   if (cachedFtsSupport !== null) {
@@ -102,6 +107,84 @@ function detectReactionColumns(db: BetterSqliteDatabase): {
   }
 
   return cachedReactionColumnSupport;
+}
+
+function detectAttachmentSupport(db: BetterSqliteDatabase): boolean {
+  if (cachedAttachmentSupport !== null) {
+    return cachedAttachmentSupport;
+  }
+
+  try {
+    const stmt: Statement = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('attachment', 'message_attachment_join')",
+    );
+    const rows = stmt.all() as { name: string }[];
+    const tableNames = rows.map((row) => row.name);
+    cachedAttachmentSupport = tableNames.includes("attachment") && tableNames.includes("message_attachment_join");
+  } catch (error) {
+    console.warn("Unable to detect attachment tables:", error);
+    cachedAttachmentSupport = false;
+  }
+
+  return cachedAttachmentSupport;
+}
+
+const REACTION_TYPE_CODE_LOOKUP: Record<number, ReactionType> = {
+  2000: "love",
+  2001: "like",
+  2002: "dislike",
+  2003: "laugh",
+  2004: "emphasize",
+  2005: "question",
+};
+
+type ReactionCountsRow = {
+  reactionCount: number | null;
+  sentCount: number | null;
+  receivedCount: number | null;
+};
+
+type AttachmentCountRow = {
+  isFromMe: number;
+  handleId: string | null;
+  handleDisplayName: string | null;
+  attachmentCount: number | null;
+};
+
+function createReactionCountSummary(): ReactionCountSummary {
+  return {
+    reactionCount: 0,
+    sentCount: 0,
+    receivedCount: 0,
+  };
+}
+
+function createReactionBreakdown(): Record<ReactionType, ReactionCountSummary> {
+  const breakdown = {} as Record<ReactionType, ReactionCountSummary>;
+  for (const type of REACTION_TYPES) {
+    breakdown[type] = createReactionCountSummary();
+  }
+  return breakdown;
+}
+
+function createEmptyReactionTotals(): ReactionTotals {
+  return {
+    ...createReactionCountSummary(),
+    byType: createReactionBreakdown(),
+  };
+}
+
+function accumulateReactionCounts(target: ReactionCountSummary, row: ReactionCountsRow) {
+  target.reactionCount += row.reactionCount ?? 0;
+  target.sentCount += row.sentCount ?? 0;
+  target.receivedCount += row.receivedCount ?? 0;
+}
+
+function mapReactionTypeCode(code: number | null | undefined): ReactionType | null {
+  if (code === null || code === undefined) {
+    return null;
+  }
+  return REACTION_TYPE_CODE_LOOKUP[Math.abs(code)] ?? null;
 }
 
 function buildFtsQuery(input: string): string {
@@ -296,6 +379,10 @@ export interface StatsOptions {
   dateRange?: { start?: Date; end?: Date };
 }
 
+export interface ChatSummaryOptions {
+  dateRange?: { start?: Date; end?: Date };
+}
+
 const DAY_BUCKET_EXPR = `
 CASE
   WHEN ABS(m.date) > 1000000000000 THEN date(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime')
@@ -312,6 +399,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const reactionColumnSupport = detectReactionColumns(db);
   const reactionsSupported =
     reactionColumnSupport.hasAssociatedGuid && reactionColumnSupport.hasAssociatedType;
+  const attachmentsSupported = detectAttachmentSupport(db);
   const participantLimit = Math.max(limit * 3, limit);
 
   const params: Record<string, unknown> = {
@@ -473,12 +561,30 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const reactionTotalsSql = reactionsSupported
     ? `
     SELECT
+      ABS(m.associated_message_type) AS reactionType,
       COUNT(m.ROWID) AS reactionCount,
       SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
       SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
     FROM message m
     JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
     ${buildWhereClause(...reactionFilterClauses)}
+    GROUP BY reactionType
+  `
+    : null;
+  const attachmentsSql = attachmentsSupported
+    ? `
+    SELECT
+      m.is_from_me AS isFromMe,
+      h.id AS handleId,
+      ${participantDisplayColumn} AS handleDisplayName,
+      COUNT(maj.attachment_id) AS attachmentCount
+    FROM message m
+    JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+    LEFT JOIN handle h ON h.ROWID = m.handle_id
+    ${buildWhereClause()}
+    GROUP BY m.is_from_me, h.id
+    HAVING attachmentCount > 0
+    ORDER BY attachmentCount DESC
   `
     : null;
 
@@ -489,6 +595,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const weekdayStmt = db.prepare(weekdaySql);
   const totalsStmt = db.prepare(totalsSql);
   const reactionTotalsStmt = reactionTotalsSql ? db.prepare(reactionTotalsSql) : null;
+  const attachmentStmt = attachmentsSql ? db.prepare(attachmentsSql) : null;
 
   const topChatsRows = topChatsStmt.all(params) as {
     chatId: number;
@@ -533,24 +640,76 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     receivedCount: number | null;
     latestMessageDate: number | null;
   } | undefined;
-  const reactionTotalsRow = reactionTotalsStmt
-    ? (reactionTotalsStmt.get(params) as {
-        reactionCount: number | null;
-        sentCount: number | null;
-        receivedCount: number | null;
-      } | undefined)
-    : undefined;
-
   const totals = {
     messageCount: totalsRow?.messageCount ?? 0,
     sentCount: totalsRow?.sentCount ?? 0,
     receivedCount: totalsRow?.receivedCount ?? 0,
   };
-  const reactionTotals: ReactionTotals = {
-    reactionCount: reactionTotalsRow?.reactionCount ?? 0,
-    sentCount: reactionTotalsRow?.sentCount ?? 0,
-    receivedCount: reactionTotalsRow?.receivedCount ?? 0,
+  const reactionTotals: ReactionTotals = createEmptyReactionTotals();
+  if (reactionTotalsStmt) {
+    const reactionTotalsRows = reactionTotalsStmt.all(params) as Array<
+      ReactionCountsRow & { reactionType: number | null }
+    >;
+    for (const row of reactionTotalsRows) {
+      accumulateReactionCounts(reactionTotals, row);
+      const mappedType = mapReactionTypeCode(row.reactionType);
+      if (mappedType) {
+        accumulateReactionCounts(reactionTotals.byType[mappedType], row);
+      }
+    }
+  }
+  const attachmentStats: AttachmentStats = {
+    totalCount: 0,
+    sentCount: 0,
+    receivedCount: 0,
+    topSender: null,
   };
+  if (attachmentStmt) {
+    const attachmentRows = attachmentStmt.all(params) as AttachmentCountRow[];
+    attachmentRows.forEach((row, index) => {
+      const count = row.attachmentCount ?? 0;
+      if (count <= 0) {
+        return;
+      }
+      const isFromMe = row.isFromMe === 1;
+      attachmentStats.totalCount += count;
+      if (isFromMe) {
+        attachmentStats.sentCount += count;
+      } else {
+        attachmentStats.receivedCount += count;
+      }
+
+      const contactInfo = row.handleId ? getContactInfoForHandle(row.handleId) : null;
+      const contactName = row.handleId ? getContactNameForHandle(row.handleId) : null;
+      const normalizedHandle = row.handleId ? normalizeHandleIdentifier(row.handleId) : null;
+
+      const preferredName = isFromMe
+        ? (() => {
+            const inferred = contactInfo?.name ?? contactName;
+            return inferred && inferred.toLowerCase() !== "me" ? inferred : "You";
+          })()
+        : contactInfo?.name ??
+          contactName ??
+          (row.handleDisplayName && row.handleDisplayName !== row.handleId ? row.handleDisplayName : null) ??
+          row.handleId ??
+          "Unknown";
+
+      const participantId = isFromMe
+        ? "me"
+        : contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+          ? `contact-${contactInfo.recordId}`
+          : normalizedHandle ?? row.handleId ?? `attachment-participant-${index}`;
+
+      if (!attachmentStats.topSender || count > attachmentStats.topSender.count) {
+        attachmentStats.topSender = {
+          id: participantId,
+          displayName: preferredName,
+          count,
+          isMe: isFromMe,
+        };
+      }
+    });
+  }
   const latestMessageAt = fromAppleTimestamp(totalsRow?.latestMessageDate ?? null);
   const reactionTotalsByChat = new Map<number, ReactionTotals>();
   const reactionParticipantsByChat = new Map<number, ChatReactionParticipantStats[]>();
@@ -670,29 +829,35 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     const perChatSql = `
       SELECT
         cmj.chat_id AS chatId,
+        ABS(m.associated_message_type) AS reactionType,
         COUNT(m.ROWID) AS reactionCount,
         SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
         SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
       FROM message m
       JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
       ${buildWhereClause(...reactionFilterClauses, chatFilterClause)}
-      GROUP BY cmj.chat_id
+      GROUP BY cmj.chat_id, reactionType
     `;
 
     const perChatStmt = db.prepare(perChatSql);
-    const perChatRows = perChatStmt.all({ ...params, ...chatIdParams }) as {
-      chatId: number;
-      reactionCount: number | null;
-      sentCount: number | null;
-      receivedCount: number | null;
-    }[];
+    const perChatRows = perChatStmt.all({ ...params, ...chatIdParams }) as Array<
+      ReactionCountsRow & {
+        chatId: number;
+        reactionType: number | null;
+      }
+    >;
 
     for (const row of perChatRows) {
-      reactionTotalsByChat.set(row.chatId, {
-        reactionCount: row.reactionCount ?? 0,
-        sentCount: row.sentCount ?? 0,
-        receivedCount: row.receivedCount ?? 0,
-      });
+      const existing = reactionTotalsByChat.get(row.chatId);
+      const perChatTotals = existing ?? createEmptyReactionTotals();
+      if (!existing) {
+        reactionTotalsByChat.set(row.chatId, perChatTotals);
+      }
+      accumulateReactionCounts(perChatTotals, row);
+      const mappedType = mapReactionTypeCode(row.reactionType);
+      if (mappedType) {
+        accumulateReactionCounts(perChatTotals.byType[mappedType], row);
+      }
     }
 
     const reactionParticipantsSql = `
@@ -786,12 +951,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     const isGroup =
       participantNames.length > 0 ? participantNames.length > 1 : row.participantCount > 1;
 
-    const chatReactions: ReactionTotals =
-      reactionTotalsByChat.get(row.chatId) ?? {
-        reactionCount: 0,
-        sentCount: 0,
-        receivedCount: 0,
-      };
+    const chatReactions: ReactionTotals = reactionTotalsByChat.get(row.chatId) ?? createEmptyReactionTotals();
     const chatReactionParticipants = reactionParticipantsByChat.get(row.chatId) ?? [];
 
     return {
@@ -881,6 +1041,342 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     weekdayCounts,
     totals,
     reactionTotals,
+    attachmentStats,
     latestMessageAt,
+  };
+}
+
+export function getChatSummaryById(chatId: number, options: ChatSummaryOptions = {}): ChatSummary | null {
+  if (!Number.isInteger(chatId) || chatId <= 0) {
+    return null;
+  }
+
+  const db = getDatabase();
+  const { dateRange } = options;
+  const hasDisplayName = detectHandleDisplayName(db);
+  const hasDeletionFlag = detectMessageDeletionColumn(db);
+  const reactionColumnSupport = detectReactionColumns(db);
+  const reactionsSupported =
+    reactionColumnSupport.hasAssociatedGuid && reactionColumnSupport.hasAssociatedType;
+
+  const params: Record<string, unknown> = { chatId };
+  const messageFilters: string[] = [];
+  if (hasDeletionFlag) {
+    messageFilters.push("m.is_deleted = 0");
+  }
+  if (dateRange?.start) {
+    params.start = toAppleTimestamp(dateRange.start);
+    messageFilters.push("m.date >= @start");
+  }
+  if (dateRange?.end) {
+    params.end = toAppleTimestamp(dateRange.end);
+    messageFilters.push("m.date <= @end");
+  }
+
+  const buildWhereClause = (...additional: string[]) => {
+    const filters = ["cmj.chat_id = @chatId", ...messageFilters, ...additional.filter(Boolean)];
+    return filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  };
+
+  const statsSql = `
+    SELECT
+      c.ROWID AS chatId,
+      c.display_name AS chatDisplayName,
+      COUNT(m.ROWID) AS messageCount,
+      SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
+      SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount,
+      MAX(m.date) AS lastMessageDate
+    FROM chat c
+    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+    JOIN message m ON m.ROWID = cmj.message_id
+    ${buildWhereClause()}
+    GROUP BY c.ROWID
+  `;
+
+  const participantsSql = `
+    WITH combined AS (
+      SELECT
+        chj.chat_id AS chatId,
+        h.ROWID AS handleRowId,
+        h.id AS handleId
+      FROM chat_handle_join chj
+      LEFT JOIN handle h ON h.ROWID = chj.handle_id
+      WHERE chj.chat_id = @chatId
+      UNION ALL
+      SELECT
+        cmj.chat_id AS chatId,
+        h.ROWID AS handleRowId,
+        h.id AS handleId
+      FROM chat_message_join cmj
+      JOIN message m ON m.ROWID = cmj.message_id
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      ${buildWhereClause()}
+    )
+    SELECT
+      COUNT(DISTINCT handleRowId) AS participantCount,
+      GROUP_CONCAT(DISTINCT handleId) AS participants
+    FROM combined
+    WHERE chatId = @chatId
+  `;
+
+  const participantDisplayColumn = hasDisplayName ? "h.display_name" : "NULL";
+
+  const messageParticipantsSql = `
+    SELECT
+      h.id AS handleId,
+      ${participantDisplayColumn} AS handleDisplayName,
+      m.is_from_me AS isFromMe,
+      COUNT(m.ROWID) AS messageCount,
+      SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
+      SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    LEFT JOIN handle h ON h.ROWID = m.handle_id
+    ${buildWhereClause()}
+    GROUP BY h.id, m.is_from_me
+    HAVING messageCount > 0
+  `;
+
+  const reactionFilterClauses = reactionsSupported
+    ? ["m.associated_message_guid IS NOT NULL", "ABS(m.associated_message_type) BETWEEN 2000 AND 2005"]
+    : [];
+
+  const reactionTotalsSql = reactionsSupported
+    ? `
+    SELECT
+      ABS(m.associated_message_type) AS reactionType,
+      COUNT(m.ROWID) AS reactionCount,
+      SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
+      SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    ${buildWhereClause(...reactionFilterClauses)}
+    GROUP BY reactionType
+  `
+    : null;
+
+  const reactionParticipantsSql = reactionsSupported
+    ? `
+    SELECT
+      h.id AS handleId,
+      ${participantDisplayColumn} AS handleDisplayName,
+      m.is_from_me AS isFromMe,
+      COUNT(m.ROWID) AS reactionCount
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    LEFT JOIN handle h ON h.ROWID = m.handle_id
+    ${buildWhereClause(...reactionFilterClauses)}
+    GROUP BY h.id, m.is_from_me
+    HAVING reactionCount > 0
+  `
+    : null;
+
+  const statsStmt = db.prepare(statsSql);
+  const participantsStmt = db.prepare(participantsSql);
+  const messageParticipantsStmt = db.prepare(messageParticipantsSql);
+  const reactionTotalsStmt = reactionTotalsSql ? db.prepare(reactionTotalsSql) : null;
+  const reactionParticipantsStmt = reactionParticipantsSql ? db.prepare(reactionParticipantsSql) : null;
+
+  let fallbackChatDisplayName: string | null = null;
+
+  const statsRow = statsStmt.get(params) as {
+    chatId: number;
+    chatDisplayName: string | null;
+    messageCount: number | null;
+    sentCount: number | null;
+    receivedCount: number | null;
+    lastMessageDate: number | null;
+  } | undefined;
+
+  if (!statsRow) {
+    const chatExists = db
+      .prepare("SELECT c.ROWID AS chatId, c.display_name AS chatDisplayName FROM chat c WHERE c.ROWID = @chatId")
+      .get({ chatId }) as { chatId: number; chatDisplayName: string | null } | undefined;
+    if (!chatExists) {
+      return null;
+    }
+    fallbackChatDisplayName = chatExists.chatDisplayName ?? null;
+  }
+
+  const participantsRow = participantsStmt.get(params) as {
+    participantCount: number | null;
+    participants: string | null;
+  } | undefined;
+
+  const participantNames = collectParticipants(participantsRow?.participants ?? null);
+  const participantCount = participantsRow?.participantCount ?? participantNames.length;
+  const derivedName =
+    participantNames.length === 1
+      ? participantNames[0]
+      : statsRow?.chatDisplayName ??
+          fallbackChatDisplayName ??
+          (participantNames.length > 0 ? participantNames.join(", ") : null);
+  const isGroup = participantNames.length > 1 ? true : participantCount > 1;
+
+  const totals = {
+    messageCount: statsRow?.messageCount ?? 0,
+    sentCount: statsRow?.sentCount ?? 0,
+    receivedCount: statsRow?.receivedCount ?? 0,
+  };
+  const lastMessageAt = fromAppleTimestamp(statsRow?.lastMessageDate ?? null);
+
+  const messageParticipantRows = messageParticipantsStmt.all(params) as {
+    handleId: string | null;
+    handleDisplayName: string | null;
+    isFromMe: number;
+    messageCount: number;
+    sentCount: number;
+    receivedCount: number;
+  }[];
+
+  const messageParticipantsAggregate = new Map<string, ChatParticipantStats>();
+  for (const row of messageParticipantRows) {
+    const isFromMe = row.isFromMe === 1;
+    const contactInfo = row.handleId ? getContactInfoForHandle(row.handleId) : null;
+    const normalizedHandle = row.handleId ? normalizeHandleIdentifier(row.handleId) : null;
+
+    const aggregateKey = isFromMe
+      ? "me"
+      : contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+        ? `contact:${contactInfo.recordId}`
+        : normalizedHandle
+          ? `handle:${normalizedHandle}`
+          : row.handleId
+            ? `raw:${row.handleId}`
+            : `unknown:${chatId}`;
+
+    const participantId = isFromMe
+      ? "me"
+      : contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+        ? `contact-${contactInfo.recordId}`
+        : normalizedHandle ?? row.handleId ?? `chat-${chatId}-unknown`;
+
+    const selfPreferredName =
+      contactInfo?.name && contactInfo.name.toLowerCase() !== "me" ? contactInfo.name : "You";
+    const preferredName = isFromMe
+      ? selfPreferredName
+      : contactInfo?.name ??
+        (row.handleDisplayName && row.handleDisplayName !== row.handleId ? row.handleDisplayName : null) ??
+        row.handleId ??
+        "Unknown";
+
+    const existing = messageParticipantsAggregate.get(aggregateKey);
+    if (existing) {
+      existing.messageCount += row.messageCount;
+      existing.sentCount += row.sentCount;
+      existing.receivedCount += row.receivedCount;
+      if (isFromMe) {
+        existing.isMe = true;
+      }
+      if (!existing.displayName && preferredName) {
+        existing.displayName = preferredName;
+      }
+      continue;
+    }
+
+    messageParticipantsAggregate.set(aggregateKey, {
+      id: participantId,
+      displayName: preferredName,
+      messageCount: row.messageCount,
+      sentCount: row.sentCount,
+      receivedCount: row.receivedCount,
+      isMe: isFromMe,
+    });
+  }
+
+  const messageParticipants = Array.from(messageParticipantsAggregate.values()).sort(
+    (a, b) => b.messageCount - a.messageCount || (a.displayName ?? "").localeCompare(b.displayName ?? ""),
+  );
+
+  const reactionTotals: ReactionTotals = createEmptyReactionTotals();
+  if (reactionTotalsStmt) {
+    const reactionTotalsRows = reactionTotalsStmt.all(params) as Array<
+      ReactionCountsRow & { reactionType: number | null }
+    >;
+    for (const row of reactionTotalsRows) {
+      accumulateReactionCounts(reactionTotals, row);
+      const mappedType = mapReactionTypeCode(row.reactionType);
+      if (mappedType) {
+        accumulateReactionCounts(reactionTotals.byType[mappedType], row);
+      }
+    }
+  }
+
+  const reactionParticipants: ChatReactionParticipantStats[] = [];
+  if (reactionParticipantsStmt) {
+    const rows = reactionParticipantsStmt.all(params) as {
+      handleId: string | null;
+      handleDisplayName: string | null;
+      isFromMe: number;
+      reactionCount: number;
+    }[];
+
+    const aggregate = new Map<string, ChatReactionParticipantStats>();
+    for (const row of rows) {
+      const isFromMe = row.isFromMe === 1;
+      const contactInfo = row.handleId ? getContactInfoForHandle(row.handleId) : null;
+      const normalizedHandle = row.handleId ? normalizeHandleIdentifier(row.handleId) : null;
+
+      const aggregateKey = isFromMe
+        ? "me"
+        : contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+          ? `contact:${contactInfo.recordId}`
+          : normalizedHandle
+            ? `handle:${normalizedHandle}`
+            : row.handleId
+              ? `raw:${row.handleId}`
+              : `unknown:${chatId}`;
+
+      const participantId = isFromMe
+        ? "me"
+        : contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+          ? `contact-${contactInfo.recordId}`
+          : normalizedHandle ?? row.handleId ?? `chat-${chatId}-unknown-reactor`;
+
+      const selfPreferredName =
+        contactInfo?.name && contactInfo.name.toLowerCase() !== "me" ? contactInfo.name : "You";
+      const preferredName = isFromMe
+        ? selfPreferredName
+        : contactInfo?.name ??
+          (row.handleDisplayName && row.handleDisplayName !== row.handleId ? row.handleDisplayName : null) ??
+          row.handleId ??
+          "Unknown";
+
+      const existing = aggregate.get(aggregateKey);
+      if (existing) {
+        existing.reactionCount += row.reactionCount;
+        if (!existing.displayName && preferredName) {
+          existing.displayName = preferredName;
+        }
+        continue;
+      }
+
+      aggregate.set(aggregateKey, {
+        id: participantId,
+        displayName: preferredName,
+        reactionCount: row.reactionCount,
+        isMe: isFromMe,
+      });
+    }
+
+    reactionParticipants.push(
+      ...Array.from(aggregate.values()).sort(
+        (a, b) => b.reactionCount - a.reactionCount || (a.displayName ?? "").localeCompare(b.displayName ?? ""),
+      ),
+    );
+  }
+
+  return {
+    chatId,
+    chatDisplayName: derivedName,
+    isGroup,
+    participants: participantNames,
+    messageCount: totals.messageCount,
+    sentCount: totals.sentCount,
+    receivedCount: totals.receivedCount,
+    lastMessageAt,
+    reactions: reactionTotals,
+    reactionParticipants,
+    messageParticipants,
   };
 }

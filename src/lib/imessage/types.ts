@@ -34,10 +34,34 @@ export interface ChatParticipantStats {
   isMe?: boolean;
 }
 
-export interface ReactionTotals {
+export const REACTION_TYPES = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const;
+
+export type ReactionType = (typeof REACTION_TYPES)[number];
+
+export interface ReactionCountSummary {
   reactionCount: number;
   sentCount: number;
   receivedCount: number;
+}
+
+export type ReactionBreakdown = Record<ReactionType, ReactionCountSummary>;
+
+export interface ReactionTotals extends ReactionCountSummary {
+  byType: ReactionBreakdown;
+}
+
+export interface AttachmentTopSender {
+  id: string | null;
+  displayName: string | null;
+  count: number;
+  isMe: boolean;
+}
+
+export interface AttachmentStats {
+  totalCount: number;
+  sentCount: number;
+  receivedCount: number;
+  topSender: AttachmentTopSender | null;
 }
 
 export interface ChatReactionParticipantStats {
@@ -93,5 +117,6 @@ export interface ConversationStats {
   weekdayCounts: WeekdayCount[];
   totals: MessageTotals;
   reactionTotals: ReactionTotals;
+  attachmentStats: AttachmentStats;
   latestMessageAt: Date | null;
 }

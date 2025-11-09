@@ -20,6 +20,13 @@ export interface MockMessage {
   sentAt: Date;
   associatedMessageGuid?: string | null;
   associatedMessageType?: number | null;
+  attachments?: MockAttachment[];
+}
+
+export interface MockAttachment {
+  filename: string;
+  mimeType: string;
+  totalBytes?: number;
 }
 
 export interface MockChat {
@@ -100,6 +107,41 @@ const DEFAULT_MESSAGES: MockMessage[] = [
     associatedMessageGuid: "msg-1",
     associatedMessageType: 2001,
   },
+  {
+    guid: "msg-7",
+    chatGuid: "chat1",
+    handleId: "+15555550100",
+    text: "Dropping the photos from the hike.",
+    isFromMe: false,
+    sentAt: new Date("2024-08-02T14:00:00Z"),
+    attachments: [
+      {
+        filename: "hike-photo.jpg",
+        mimeType: "image/jpeg",
+        totalBytes: 512_000,
+      },
+    ],
+  },
+  {
+    guid: "msg-8",
+    chatGuid: "chat1",
+    handleId: null,
+    text: "Here’s the packing list and playlist.",
+    isFromMe: true,
+    sentAt: new Date("2024-08-02T14:05:00Z"),
+    attachments: [
+      {
+        filename: "packing-list.pdf",
+        mimeType: "application/pdf",
+        totalBytes: 204_800,
+      },
+      {
+        filename: "mix.aac",
+        mimeType: "audio/aac",
+        totalBytes: 102_400,
+      },
+    ],
+  },
 ];
 
 export interface CreateMockDbOptions {
@@ -174,6 +216,23 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       message_date INTEGER
     );
 
+    CREATE TABLE attachment (
+      ROWID INTEGER PRIMARY KEY,
+      guid TEXT,
+      created_date INTEGER,
+      start_date INTEGER,
+      filename TEXT,
+      mime_type TEXT,
+      transfer_name TEXT,
+      total_bytes INTEGER,
+      is_outgoing INTEGER
+    );
+
+    CREATE TABLE message_attachment_join (
+      message_id INTEGER,
+      attachment_id INTEGER
+    );
+
     CREATE VIRTUAL TABLE message_fts USING fts5(text, content='message', content_rowid='ROWID');
   `);
 
@@ -232,7 +291,8 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       date,
       is_from_me,
       associated_message_guid,
-      associated_message_type
+      associated_message_type,
+      cache_has_attachments
     )
     VALUES (
       @rowId,
@@ -242,7 +302,8 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       @date,
       @isFromMe,
       @associatedMessageGuid,
-      @associatedMessageType
+      @associatedMessageType,
+      @cacheHasAttachments
     )
   `);
 
@@ -254,14 +315,45 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
   const insertFts = db.prepare(`
     INSERT INTO message_fts (rowid, text) VALUES (@rowId, @text)
   `);
+  const insertAttachment = db.prepare(`
+    INSERT INTO attachment (
+      ROWID,
+      guid,
+      created_date,
+      start_date,
+      filename,
+      mime_type,
+      transfer_name,
+      total_bytes,
+      is_outgoing
+    )
+    VALUES (
+      @rowId,
+      @guid,
+      @createdDate,
+      @startDate,
+      @filename,
+      @mimeType,
+      @transferName,
+      @totalBytes,
+      @isOutgoing
+    )
+  `);
+
+  const insertMessageAttachmentJoin = db.prepare(`
+    INSERT INTO message_attachment_join (message_id, attachment_id)
+    VALUES (@messageId, @attachmentId)
+  `);
 
   let messageRowId = 1;
+  let attachmentRowId = 1;
   messages.forEach((message) => {
     const rowId = messageRowId++;
     const chatId = chatRowIds[message.chatGuid];
     if (!chatId) {
       throw new Error(`Unknown chat GUID: ${message.chatGuid}`);
     }
+    const attachments = message.attachments ?? [];
 
     insertMessage.run({
       rowId,
@@ -272,6 +364,7 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       isFromMe: message.isFromMe ? 1 : 0,
       associatedMessageGuid: message.associatedMessageGuid ?? null,
       associatedMessageType: message.associatedMessageType ?? null,
+      cacheHasAttachments: attachments.length > 0 ? 1 : 0,
     });
 
     insertChatMessageJoin.run({
@@ -284,6 +377,29 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       rowId,
       text: message.text,
     });
+
+    if (attachments.length > 0) {
+      attachments.forEach((attachment, index) => {
+        const attachmentId = attachmentRowId++;
+        const appleTimestamp = toAppleTimestamp(message.sentAt);
+        insertAttachment.run({
+          rowId: attachmentId,
+          guid: `${message.guid}-attachment-${index + 1}`,
+          createdDate: appleTimestamp,
+          startDate: appleTimestamp,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          transferName: attachment.filename,
+          totalBytes: attachment.totalBytes ?? 0,
+          isOutgoing: message.isFromMe ? 1 : 0,
+        });
+
+        insertMessageAttachmentJoin.run({
+          messageId: rowId,
+          attachmentId,
+        });
+      });
+    }
   });
 
   const dispose = () => {
