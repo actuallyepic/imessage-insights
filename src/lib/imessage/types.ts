@@ -31,6 +31,68 @@ export interface ChatParticipantStats {
   messageCount: number;
   sentCount: number;
   receivedCount: number;
+  isMe?: boolean;
+}
+
+export const REACTION_TYPES = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const;
+
+export type ReactionType = (typeof REACTION_TYPES)[number];
+
+export interface ReactionCountSummary {
+  reactionCount: number;
+  sentCount: number;
+  receivedCount: number;
+}
+
+export type ReactionBreakdown = Record<ReactionType, ReactionCountSummary>;
+
+export interface ReactionTotals extends ReactionCountSummary {
+  byType: ReactionBreakdown;
+}
+
+export interface GhostingStats {
+  iGhosted: number;
+  theyGhostedMe: number;
+}
+
+export interface ConversationInitiationStats {
+  startedByMe: number;
+  startedByOthers: number;
+}
+
+export interface ResponseDirectionStats {
+  averageSeconds: number | null;
+  medianSeconds: number | null;
+  p90Seconds: number | null;
+  minSeconds: number | null;
+  maxSeconds: number | null;
+  sampleCount: number;
+}
+
+export interface ResponseStats {
+  meResponding: ResponseDirectionStats;
+  themResponding: ResponseDirectionStats;
+}
+
+export interface AttachmentTopSender {
+  id: string | null;
+  displayName: string | null;
+  count: number;
+  isMe: boolean;
+}
+
+export interface AttachmentStats {
+  totalCount: number;
+  sentCount: number;
+  receivedCount: number;
+  topSender: AttachmentTopSender | null;
+}
+
+export interface ChatReactionParticipantStats {
+  id: string;
+  displayName: string | null;
+  reactionCount: number;
+  isMe: boolean;
 }
 
 export interface ChatSummary {
@@ -41,7 +103,14 @@ export interface ChatSummary {
   messageCount: number;
   sentCount: number;
   receivedCount: number;
+  firstMessageAt: Date | null;
   lastMessageAt: Date | null;
+  ghosting: GhostingStats;
+  conversationInitiation: ConversationInitiationStats;
+  responseTimes: ResponseStats;
+  reactions: ReactionTotals;
+  reactionParticipants: ChatReactionParticipantStats[];
+  messageParticipants: ChatParticipantStats[];
 }
 
 export interface DailyCount {
@@ -62,10 +131,43 @@ export interface WeekdayCount {
   receivedCount: number;
 }
 
+export interface MessageTotals {
+  messageCount: number;
+  sentCount: number;
+  receivedCount: number;
+}
+
 export interface ConversationStats {
   topChats: ChatSummary[];
   participantBreakdown: ChatParticipantStats[];
   dailyCounts: DailyCount[];
   hourlyCounts: HourlyCount[];
   weekdayCounts: WeekdayCount[];
+  totals: MessageTotals;
+  reactionTotals: ReactionTotals;
+  attachmentStats: AttachmentStats;
+  earliestMessageAt: Date | null;
+  latestMessageAt: Date | null;
+  ghosting: GhostingStats;
+  conversationInitiation: ConversationInitiationStats;
+  responseTimes: ResponseStats;
 }
+
+export type SerializableChatSummary = Omit<ChatSummary, "lastMessageAt" | "firstMessageAt"> & {
+  firstMessageAt: string | null;
+  lastMessageAt: string | null;
+};
+
+export type SerializableDailyCount = Omit<DailyCount, "date"> & {
+  date: string;
+};
+
+export type SerializableConversationStats = Omit<
+  ConversationStats,
+  "topChats" | "dailyCounts" | "latestMessageAt" | "earliestMessageAt"
+> & {
+  topChats: SerializableChatSummary[];
+  dailyCounts: SerializableDailyCount[];
+  latestMessageAt: string | null;
+  earliestMessageAt: string | null;
+};

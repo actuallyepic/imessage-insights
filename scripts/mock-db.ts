@@ -18,6 +18,15 @@ export interface MockMessage {
   text: string;
   isFromMe: boolean;
   sentAt: Date;
+  associatedMessageGuid?: string | null;
+  associatedMessageType?: number | null;
+  attachments?: MockAttachment[];
+}
+
+export interface MockAttachment {
+  filename: string;
+  mimeType: string;
+  totalBytes?: number;
 }
 
 export interface MockChat {
@@ -77,6 +86,61 @@ const DEFAULT_MESSAGES: MockMessage[] = [
     text: "Thank you! Appreciate it.",
     isFromMe: true,
     sentAt: new Date("2024-07-15T15:02:00Z"),
+  },
+  {
+    guid: "msg-5",
+    chatGuid: "chat1",
+    handleId: "+15555550101",
+    text: "Loved “Yes! 7pm at the usual spot.”",
+    isFromMe: false,
+    sentAt: new Date("2024-08-01T18:31:30Z"),
+    associatedMessageGuid: "msg-2",
+    associatedMessageType: 2000,
+  },
+  {
+    guid: "msg-6",
+    chatGuid: "chat1",
+    handleId: null,
+    text: "Liked “Are we still on for dinner tonight?”",
+    isFromMe: true,
+    sentAt: new Date("2024-08-01T18:32:00Z"),
+    associatedMessageGuid: "msg-1",
+    associatedMessageType: 2001,
+  },
+  {
+    guid: "msg-7",
+    chatGuid: "chat1",
+    handleId: "+15555550100",
+    text: "Dropping the photos from the hike.",
+    isFromMe: false,
+    sentAt: new Date("2024-08-02T14:00:00Z"),
+    attachments: [
+      {
+        filename: "hike-photo.jpg",
+        mimeType: "image/jpeg",
+        totalBytes: 512_000,
+      },
+    ],
+  },
+  {
+    guid: "msg-8",
+    chatGuid: "chat1",
+    handleId: null,
+    text: "Here’s the packing list and playlist.",
+    isFromMe: true,
+    sentAt: new Date("2024-08-02T14:05:00Z"),
+    attachments: [
+      {
+        filename: "packing-list.pdf",
+        mimeType: "application/pdf",
+        totalBytes: 204_800,
+      },
+      {
+        filename: "mix.aac",
+        mimeType: "audio/aac",
+        totalBytes: 102_400,
+      },
+    ],
   },
 ];
 
@@ -141,6 +205,8 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       date_read INTEGER,
       date_delivered INTEGER,
       is_from_me INTEGER,
+      associated_message_guid TEXT,
+      associated_message_type INTEGER,
       cache_has_attachments INTEGER DEFAULT 0
     );
 
@@ -148,6 +214,23 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       chat_id INTEGER,
       message_id INTEGER,
       message_date INTEGER
+    );
+
+    CREATE TABLE attachment (
+      ROWID INTEGER PRIMARY KEY,
+      guid TEXT,
+      created_date INTEGER,
+      start_date INTEGER,
+      filename TEXT,
+      mime_type TEXT,
+      transfer_name TEXT,
+      total_bytes INTEGER,
+      is_outgoing INTEGER
+    );
+
+    CREATE TABLE message_attachment_join (
+      message_id INTEGER,
+      attachment_id INTEGER
     );
 
     CREATE VIRTUAL TABLE message_fts USING fts5(text, content='message', content_rowid='ROWID');
@@ -200,8 +283,28 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
   });
 
   const insertMessage = db.prepare(`
-    INSERT INTO message (ROWID, guid, handle_id, text, date, is_from_me)
-    VALUES (@rowId, @guid, @handleId, @text, @date, @isFromMe)
+    INSERT INTO message (
+      ROWID,
+      guid,
+      handle_id,
+      text,
+      date,
+      is_from_me,
+      associated_message_guid,
+      associated_message_type,
+      cache_has_attachments
+    )
+    VALUES (
+      @rowId,
+      @guid,
+      @handleId,
+      @text,
+      @date,
+      @isFromMe,
+      @associatedMessageGuid,
+      @associatedMessageType,
+      @cacheHasAttachments
+    )
   `);
 
   const insertChatMessageJoin = db.prepare(`
@@ -212,14 +315,45 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
   const insertFts = db.prepare(`
     INSERT INTO message_fts (rowid, text) VALUES (@rowId, @text)
   `);
+  const insertAttachment = db.prepare(`
+    INSERT INTO attachment (
+      ROWID,
+      guid,
+      created_date,
+      start_date,
+      filename,
+      mime_type,
+      transfer_name,
+      total_bytes,
+      is_outgoing
+    )
+    VALUES (
+      @rowId,
+      @guid,
+      @createdDate,
+      @startDate,
+      @filename,
+      @mimeType,
+      @transferName,
+      @totalBytes,
+      @isOutgoing
+    )
+  `);
+
+  const insertMessageAttachmentJoin = db.prepare(`
+    INSERT INTO message_attachment_join (message_id, attachment_id)
+    VALUES (@messageId, @attachmentId)
+  `);
 
   let messageRowId = 1;
+  let attachmentRowId = 1;
   messages.forEach((message) => {
     const rowId = messageRowId++;
     const chatId = chatRowIds[message.chatGuid];
     if (!chatId) {
       throw new Error(`Unknown chat GUID: ${message.chatGuid}`);
     }
+    const attachments = message.attachments ?? [];
 
     insertMessage.run({
       rowId,
@@ -228,6 +362,9 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       text: message.text,
       date: toAppleTimestamp(message.sentAt),
       isFromMe: message.isFromMe ? 1 : 0,
+      associatedMessageGuid: message.associatedMessageGuid ?? null,
+      associatedMessageType: message.associatedMessageType ?? null,
+      cacheHasAttachments: attachments.length > 0 ? 1 : 0,
     });
 
     insertChatMessageJoin.run({
@@ -240,6 +377,29 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       rowId,
       text: message.text,
     });
+
+    if (attachments.length > 0) {
+      attachments.forEach((attachment, index) => {
+        const attachmentId = attachmentRowId++;
+        const appleTimestamp = toAppleTimestamp(message.sentAt);
+        insertAttachment.run({
+          rowId: attachmentId,
+          guid: `${message.guid}-attachment-${index + 1}`,
+          createdDate: appleTimestamp,
+          startDate: appleTimestamp,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          transferName: attachment.filename,
+          totalBytes: attachment.totalBytes ?? 0,
+          isOutgoing: message.isFromMe ? 1 : 0,
+        });
+
+        insertMessageAttachmentJoin.run({
+          messageId: rowId,
+          attachmentId,
+        });
+      });
+    }
   });
 
   const dispose = () => {
