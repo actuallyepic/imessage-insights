@@ -120,3 +120,20 @@ export interface ConversationStats {
   attachmentStats: AttachmentStats;
   latestMessageAt: Date | null;
 }
+
+export type SerializableChatSummary = Omit<ChatSummary, "lastMessageAt"> & {
+  lastMessageAt: string | null;
+};
+
+export type SerializableDailyCount = Omit<DailyCount, "date"> & {
+  date: string;
+};
+
+export type SerializableConversationStats = Omit<
+  ConversationStats,
+  "topChats" | "dailyCounts" | "latestMessageAt"
+> & {
+  topChats: SerializableChatSummary[];
+  dailyCounts: SerializableDailyCount[];
+  latestMessageAt: string | null;
+};

@@ -1,96 +1,19 @@
 'use client';
 
+import { TRPCClientError } from "@trpc/client";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
-interface ChatSummary {
-  chatId: number;
-  chatDisplayName: string | null;
-  isGroup: boolean;
-  participants: string[];
-  messageCount: number;
-  sentCount: number;
-  receivedCount: number;
-  lastMessageAt: string | null;
-  reactions: ReactionTotals;
-  reactionParticipants: ChatReactionParticipant[];
-  messageParticipants: ParticipantStats[];
-}
-
-interface ParticipantStats {
-  id: string | null;
-  displayName: string | null;
-  messageCount: number;
-  sentCount: number;
-  receivedCount: number;
-  isMe?: boolean;
-}
-
-interface DailyCount {
-  date: string;
-  sentCount: number;
-  receivedCount: number;
-}
-
-interface HourlyCount {
-  hour: number;
-  sentCount: number;
-  receivedCount: number;
-}
-
-interface WeekdayCount {
-  weekday: number;
-  sentCount: number;
-  receivedCount: number;
-}
-
-interface MessageTotals {
-  messageCount: number;
-  sentCount: number;
-  receivedCount: number;
-}
-
-interface ReactionCountSummary {
-  reactionCount: number;
-  sentCount: number;
-  receivedCount: number;
-}
-
-interface ReactionTotals extends ReactionCountSummary {
-  byType: Record<string, ReactionCountSummary>;
-}
-
-interface ChatReactionParticipant {
-  id: string;
-  displayName: string | null;
-  reactionCount: number;
-  isMe: boolean;
-}
-
-interface AttachmentTopSender {
-  id: string | null;
-  displayName: string | null;
-  count: number;
-  isMe: boolean;
-}
-
-interface AttachmentStats {
-  totalCount: number;
-  sentCount: number;
-  receivedCount: number;
-  topSender: AttachmentTopSender | null;
-}
-
-interface ConversationStats {
-  topChats: ChatSummary[];
-  participantBreakdown: ParticipantStats[];
-  dailyCounts: DailyCount[];
-  hourlyCounts: HourlyCount[];
-  weekdayCounts: WeekdayCount[];
-  totals: MessageTotals;
-  reactionTotals: ReactionTotals;
-  attachmentStats: AttachmentStats;
-  latestMessageAt: string | null;
-}
+import type {
+  HourlyCount,
+  ReactionCountSummary,
+  SerializableChatSummary as ChatSummary,
+  SerializableConversationStats as ConversationStats,
+  SerializableDailyCount as DailyCount,
+  WeekdayCount,
+} from "@/lib/imessage/types";
+import type { AppRouter } from "@/server/app-router";
+import { useTRPC } from "@/utils/trpc";
 
 type StatsRange = "1h" | "6h" | "12h" | "1d" | "3d" | "5d" | "7d" | "30d" | "90d" | "all";
 
@@ -127,6 +50,19 @@ function computeTotals(stats: ConversationStats | null) {
   if (!stats) return { sent: 0, received: 0, total: 0 };
   const { sentCount, receivedCount, messageCount } = stats.totals;
   return { sent: sentCount, received: receivedCount, total: messageCount };
+}
+
+function getStatsQueryError(error: unknown) {
+  if (error instanceof TRPCClientError<AppRouter>) {
+    return {
+      message: error.message,
+      httpStatus: error.data?.httpStatus,
+    };
+  }
+  if (error instanceof Error) {
+    return { message: error.message };
+  }
+  return { message: "Unable to load stats." };
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -426,17 +362,14 @@ function StatsOverviewSkeleton() {
 }
 
 export default function Dashboard() {
+  const trpc = useTRPC();
+  const queryClient = useQueryClient();
   const [statsRange, setStatsRange] = useState<StatsRange>(() => getStoredStatsRange());
-  const [stats, setStats] = useState<ConversationStats | null>(null);
-  const [statsLoading, setStatsLoading] = useState(false);
-  const [statsError, setStatsError] = useState<string | null>(null);
   const [chatFilterMode, setChatFilterMode] = useState<ChatFilterMode>("all");
   const [visibleChatCount, setVisibleChatCount] = useState(5);
   const [chatSearchQuery, setChatSearchQuery] = useState("");
-  const [statsRefreshToken, setStatsRefreshToken] = useState(0);
   const [activityView, setActivityView] = useState<"hourly" | "weekday">(() => getStoredActivityView());
   const [hourClockMode, setHourClockMode] = useState<HourClockMode>(() => getStoredHourFormat());
-  const [accessError, setAccessError] = useState(false);
   const [accessTipDismissed, setAccessTipDismissed] = useState(false);
   const [expandedChatSections, setExpandedChatSections] = useState<
     Record<number, { messages: boolean; reactions: boolean }>
@@ -445,6 +378,32 @@ export default function Dashboard() {
   const [reportStatus, setReportStatus] = useState<ReportStatus>("idle");
   const [reportError, setReportError] = useState<string | null>(null);
   const [reportUrl, setReportUrl] = useState<string | null>(null);
+
+  const statsQueryInput = useMemo(() => {
+    const rangeDates = getRangeDates(statsRange);
+    return {
+      limit: DEFAULT_STATS_LIMIT,
+      start: rangeDates.start,
+      end: rangeDates.end,
+    };
+  }, [statsRange]);
+
+  const statsQuery = useQuery(
+    trpc.stats.summary.queryOptions(statsQueryInput, {
+      staleTime: 60_000,
+      gcTime: 5 * 60_000,
+      refetchOnWindowFocus: true,
+      refetchOnReconnect: true,
+      retry: 1,
+    }),
+  );
+
+  const stats = statsQuery.data ?? null;
+  const statsLoading = statsQuery.isPending;
+  const statsFetching = statsQuery.isFetching;
+  const statsErrorDetails = statsQuery.error ? getStatsQueryError(statsQuery.error) : null;
+  const statsError = statsErrorDetails?.message ?? null;
+  const accessError = statsErrorDetails?.httpStatus === 403;
 
   const totals = useMemo(() => computeTotals(stats), [stats]);
   const sampledDayCount = stats?.dailyCounts.length ?? 0;
@@ -797,7 +756,9 @@ export default function Dashboard() {
     if (count === 3) return "grid gap-3 sm:grid-cols-2 lg:grid-cols-3";
     return "grid gap-3 sm:grid-cols-2 lg:grid-cols-4";
   }, [insightItems.length]);
-  const handleStatsRefresh = () => setStatsRefreshToken((token) => token + 1);
+  const handleStatsRefresh = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: trpc.stats.summary.queryKey(statsQueryInput) });
+  }, [queryClient, trpc, statsQueryInput]);
   const handleOpenReportModal = (chat: ChatSummary) => {
     setReportChat(chat);
     setReportStatus("loading");
@@ -922,46 +883,6 @@ export default function Dashboard() {
     }
   };
 
-  useEffect(() => {
-    const controller = new AbortController();
-    const params = new URLSearchParams({ limit: DEFAULT_STATS_LIMIT.toString() });
-    const rangeDates = getRangeDates(statsRange);
-    if (rangeDates.start) params.set("start", rangeDates.start);
-    if (rangeDates.end) params.set("end", rangeDates.end);
-
-    async function fetchStats() {
-      setStatsLoading(true);
-      setStatsError(null);
-      try {
-        const response = await fetch(`/api/stats?${params.toString()}`, {
-          signal: controller.signal,
-        });
-        if (!response.ok) {
-          const payload = await response.json().catch(() => ({}));
-          const error = new Error(payload.error ?? `Request failed with ${response.status}`) as Error & {
-            status?: number;
-          };
-          error.status = response.status;
-          throw error;
-        }
-        const json = (await response.json()) as { data: ConversationStats };
-        setStats(json.data);
-        setAccessError(false);
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        const errorMessage = error instanceof Error ? error.message : "Unable to load stats.";
-        setStatsError(errorMessage);
-        const status = error && typeof error === "object" ? (error as { status?: number }).status : undefined;
-        setAccessError(status === 403);
-      } finally {
-        setStatsLoading(false);
-      }
-    }
-
-    fetchStats();
-    return () => controller.abort();
-  }, [statsRange, statsRefreshToken]);
-
   const shouldShowAccessTip = accessError && !accessTipDismissed;
   const showInitialSkeleton = statsLoading && !stats && !statsError;
 
@@ -1039,7 +960,7 @@ export default function Dashboard() {
               </div>
             </div>
             {statsError && <p className="text-sm text-red-400">{statsError}</p>}
-            {statsLoading && stats && (
+            {statsFetching && stats && (
               <div className="flex items-center gap-2 text-sm text-neutral-400">
                 <Spinner /> Refreshing stats…
               </div>
@@ -1054,7 +975,7 @@ export default function Dashboard() {
             {stats && (
               <div
                 className={`space-y-5 transition-opacity duration-300 ${
-                  statsLoading ? "opacity-60" : "opacity-100"
+                  statsFetching ? "opacity-60" : "opacity-100"
                 }`}
               >
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">

@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { ShareReportButton } from "@/components/share-report-button";
 import { getChatSummaryById } from "@/lib/imessage/queries";
 import { REACTION_TYPES } from "@/lib/imessage/types";
 
@@ -8,8 +9,8 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 type ReportPageProps = {
-  params: { chatId: string };
-  searchParams?: Record<string, string | string[] | undefined>;
+  params: Promise<{ chatId: string }>;
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
 };
 
 const numberFormatter = new Intl.NumberFormat();
@@ -67,14 +68,27 @@ function formatParticipantName(name: string | null | undefined) {
   return name;
 }
 
-export default function ReportPage({ params, searchParams = {} }: ReportPageProps) {
-  const chatId = Number.parseInt(params.chatId, 10);
+function buildShareFileName(title: string) {
+  const safe = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+
+  return `${safe || "group-report"}-report.png`;
+}
+
+export default async function ReportPage({ params, searchParams }: ReportPageProps) {
+  const resolvedParams = await params;
+  const queryParams = searchParams ? await searchParams : {};
+
+  const chatId = Number.parseInt(resolvedParams.chatId, 10);
   if (!Number.isFinite(chatId) || chatId <= 0) {
     notFound();
   }
 
-  const start = parseDateParam(searchParams.start);
-  const end = parseDateParam(searchParams.end);
+  const start = parseDateParam(queryParams.start);
+  const end = parseDateParam(queryParams.end);
   const summary = getChatSummaryById(chatId, {
     dateRange: { start, end },
   });
@@ -145,12 +159,17 @@ export default function ReportPage({ params, searchParams = {} }: ReportPageProp
     },
   ] as const;
 
+  const shareFileName = buildShareFileName(title);
+
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-50">
+    <div id="report-capture" className="min-h-screen bg-neutral-950 text-neutral-50">
       <header className="relative overflow-hidden border-b border-neutral-900/80 bg-gradient-to-br from-emerald-600/15 via-neutral-950 to-neutral-950">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(16,185,129,0.18),_transparent_55%)]" />
         <div className="relative mx-auto max-w-5xl px-6 py-12">
-          <p className="text-xs font-semibold uppercase tracking-[0.4em] text-emerald-300">Group report</p>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <p className="text-xs font-semibold uppercase tracking-[0.4em] text-emerald-300">Group report</p>
+            <ShareReportButton targetId="report-capture" fileName={shareFileName} />
+          </div>
           <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white">{title}</h1>
           <div className="mt-4 flex flex-wrap gap-3 text-xs font-semibold uppercase tracking-wide text-neutral-300">
             <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1">
