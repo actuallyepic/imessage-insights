@@ -1,9 +1,9 @@
 'use client';
 
 import { TRPCClientError } from "@trpc/client";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
+import { CONVERSATION_GAP_SECONDS, GHOST_RESPONSE_THRESHOLD_SECONDS } from "@/lib/imessage/constants";
 import type {
   HourlyCount,
   ReactionCountSummary,
@@ -12,8 +12,8 @@ import type {
   SerializableDailyCount as DailyCount,
   WeekdayCount,
 } from "@/lib/imessage/types";
+import { useStatsSummary } from "@/hooks/use-stats-summary";
 import type { AppRouter } from "@/server/app-router";
-import { useTRPC } from "@/utils/trpc";
 
 type StatsRange = "1h" | "6h" | "12h" | "1d" | "3d" | "5d" | "7d" | "30d" | "90d" | "all";
 
@@ -44,6 +44,35 @@ function formatPercent(part: number, total: number) {
   }
   const percentage = (part / total) * 100;
   return `${Math.round(percentage)}%`;
+}
+
+function formatResponseDuration(seconds: number | null | undefined) {
+  if (!Number.isFinite(seconds ?? NaN) || seconds === null || seconds === undefined) return "—";
+  const value = Math.max(0, seconds);
+  if (value < 60) return `${Math.round(value)}s`;
+  if (value < 3600) {
+    const minutes = value / 60;
+    return minutes >= 10 ? `${Math.round(minutes)}m` : `${minutes.toFixed(1)}m`;
+  }
+  if (value < 86400) {
+    const hours = value / 3600;
+    return hours >= 10 ? `${Math.round(hours)}h` : `${hours.toFixed(1)}h`;
+  }
+  const days = value / 86400;
+  return days >= 10 ? `${Math.round(days)}d` : `${days.toFixed(1)}d`;
+}
+
+function formatDurationLabel(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "Unknown duration";
+  const hours = seconds / 3600;
+  if (Number.isInteger(hours)) {
+    if (hours % 24 === 0) {
+      const days = hours / 24;
+      return `${formatNumber(days)} day${days === 1 ? "" : "s"}`;
+    }
+    return `${formatNumber(hours)} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${hours.toFixed(1)} hours`;
 }
 
 function computeTotals(stats: ConversationStats | null) {
@@ -88,6 +117,23 @@ const ACCESS_TIP_STORAGE_KEY = "imessage-insights:fda-tip-dismissed";
 const STATS_RANGE_STORAGE_KEY = "imessage-insights:stats-range";
 const ACTIVITY_VIEW_STORAGE_KEY = "imessage-insights:activity-view";
 const HOUR_FORMAT_STORAGE_KEY = "imessage-insights:hour-format";
+const EMPTY_GHOSTING = { iGhosted: 0, theyGhostedMe: 0 } as const;
+const EMPTY_CONVERSATION_INIT = { startedByMe: 0, startedByOthers: 0 } as const;
+const EMPTY_RESPONSE_DIRECTION = {
+  averageSeconds: null,
+  medianSeconds: null,
+  p90Seconds: null,
+  minSeconds: null,
+  maxSeconds: null,
+  sampleCount: 0,
+} as const;
+
+function createEmptyResponseStatsClient() {
+  return {
+    meResponding: { ...EMPTY_RESPONSE_DIRECTION },
+    themResponding: { ...EMPTY_RESPONSE_DIRECTION },
+  };
+}
 
 function readStoredValue<T>(key: string) {
   if (typeof window === "undefined") return null;
@@ -258,6 +304,28 @@ function ClockIcon({ className }: IconProps) {
   );
 }
 
+function GhostIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" className={className} role="img">
+      <path
+        fill="currentColor"
+        d="M12 2a7 7 0 0 0-7 7v9.5c0 .83.67 1.5 1.5 1.5.5 0 .96-.25 1.24-.64l.76-1.12.76 1.12c.28.39.74.64 1.24.64s.96-.25 1.25-.64L12.5 18l.75 1.36c.29.39.75.64 1.25.64s.96-.25 1.24-.64l.76-1.12.76 1.12c.28.39.74.64 1.24.64.83 0 1.5-.67 1.5-1.5V9a7 7 0 0 0-7-7m-2.25 5A1.25 1.25 0 1 1 9 8.25 1.25 1.25 0 0 1 9.75 7m4.5 0A1.25 1.25 0 1 1 15 8.25 1.25 1.25 0 0 1 14.25 7M14 12a2 2 0 0 1-4 0z"
+      />
+    </svg>
+  );
+}
+
+function SparkIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" className={className} role="img">
+      <path
+        fill="currentColor"
+        d="M12 2 9.5 8.5 3 11l6.5 2.5L12 20l2.5-6.5L21 11l-6.5-2.5z"
+      />
+    </svg>
+  );
+}
+
 
 type ChatFilterMode = "all" | "direct" | "group";
 type HourClockMode = "12h" | "24h";
@@ -362,8 +430,6 @@ function StatsOverviewSkeleton() {
 }
 
 export default function Dashboard() {
-  const trpc = useTRPC();
-  const queryClient = useQueryClient();
   const [statsRange, setStatsRange] = useState<StatsRange>(() => getStoredStatsRange());
   const [chatFilterMode, setChatFilterMode] = useState<ChatFilterMode>("all");
   const [visibleChatCount, setVisibleChatCount] = useState(5);
@@ -388,20 +454,68 @@ export default function Dashboard() {
     };
   }, [statsRange]);
 
-  const statsQuery = useQuery(
-    trpc.stats.summary.queryOptions(statsQueryInput, {
-      staleTime: 60_000,
-      gcTime: 5 * 60_000,
-      refetchOnWindowFocus: true,
-      refetchOnReconnect: true,
-      retry: 1,
-    }),
-  );
+  const {
+    data: statsData,
+    isPending: statsLoading,
+    isFetching: statsFetching,
+    error: statsErrorRaw,
+    refetch: refetchStats,
+  } = useStatsSummary(statsQueryInput);
 
-  const stats = statsQuery.data ?? null;
-  const statsLoading = statsQuery.isPending;
-  const statsFetching = statsQuery.isFetching;
-  const statsErrorDetails = statsQuery.error ? getStatsQueryError(statsQuery.error) : null;
+  const stats = statsData ?? null;
+  const responseTimes = stats?.responseTimes ?? null;
+  const myResponseStats = responseTimes?.meResponding ?? null;
+  const theirResponseStats = responseTimes?.themResponding ?? null;
+  const myResponseSummary = {
+    median: formatResponseDuration(myResponseStats?.medianSeconds),
+    p90: formatResponseDuration(myResponseStats?.p90Seconds),
+    fastest: formatResponseDuration(myResponseStats?.minSeconds),
+    slowest: formatResponseDuration(myResponseStats?.maxSeconds),
+    samples: myResponseStats?.sampleCount ?? 0,
+  };
+  const theirResponseSummary = {
+    median: formatResponseDuration(theirResponseStats?.medianSeconds),
+    p90: formatResponseDuration(theirResponseStats?.p90Seconds),
+    fastest: formatResponseDuration(theirResponseStats?.minSeconds),
+    slowest: formatResponseDuration(theirResponseStats?.maxSeconds),
+    samples: theirResponseStats?.sampleCount ?? 0,
+  };
+  const ghostingStats = useMemo(() => stats?.ghosting ?? EMPTY_GHOSTING, [stats]);
+  const conversationInitiationStats = useMemo(
+    () => stats?.conversationInitiation ?? EMPTY_CONVERSATION_INIT,
+    [stats],
+  );
+  const ghostingThresholdLabel = formatDurationLabel(GHOST_RESPONSE_THRESHOLD_SECONDS);
+  const conversationGapLabel = formatDurationLabel(CONVERSATION_GAP_SECONDS);
+  const ghostingSummary = useMemo(() => {
+    const totalEvents = ghostingStats.iGhosted + ghostingStats.theyGhostedMe;
+    const theyPercent = totalEvents > 0 ? Math.round((ghostingStats.theyGhostedMe / totalEvents) * 100) : null;
+    const mePercent = totalEvents > 0 ? 100 - (theyPercent ?? 0) : null;
+    const narrative =
+      totalEvents === 0
+        ? "Not enough long pauses to assess yet."
+        : ghostingStats.theyGhostedMe > ghostingStats.iGhosted
+          ? "You get ghosted more often."
+          : ghostingStats.theyGhostedMe < ghostingStats.iGhosted
+            ? "You ghost more often."
+            : "Ghosting is evenly split.";
+    return { totalEvents, theyPercent, mePercent, narrative };
+  }, [ghostingStats]);
+  const conversationSummary = useMemo(() => {
+    const totalStarts = conversationInitiationStats.startedByMe + conversationInitiationStats.startedByOthers;
+    const mePercent = totalStarts > 0 ? Math.round((conversationInitiationStats.startedByMe / totalStarts) * 100) : null;
+    const othersPercent = totalStarts > 0 ? 100 - (mePercent ?? 0) : null;
+    const narrative =
+      totalStarts === 0
+        ? "No conversation gaps detected yet."
+        : conversationInitiationStats.startedByMe > conversationInitiationStats.startedByOthers
+          ? "You usually kick things off."
+          : conversationInitiationStats.startedByMe < conversationInitiationStats.startedByOthers
+            ? "Others start most conversations."
+            : "Conversation openers are evenly shared.";
+    return { totalStarts, mePercent, othersPercent, narrative };
+  }, [conversationInitiationStats]);
+  const statsErrorDetails = statsErrorRaw ? getStatsQueryError(statsErrorRaw) : null;
   const statsError = statsErrorDetails?.message ?? null;
   const accessError = statsErrorDetails?.httpStatus === 403;
 
@@ -449,13 +563,16 @@ export default function Dashboard() {
     return Math.max(0, Math.round(stats.totals.receivedCount / sampledDayCount));
   }, [sampledDayCount, stats]);
   const earliestMessageDate = useMemo(() => {
+    if (stats?.earliestMessageAt) {
+      return stats.earliestMessageAt;
+    }
     if (!stats || stats.dailyCounts.length === 0) return null;
-    const earliest = stats.dailyCounts.reduce<string | null>((min, bucket) => {
+    // Fallback for older responses that do not include earliestMessageAt.
+    return stats.dailyCounts.reduce<string | null>((min, bucket) => {
       if (!bucket.date) return min;
       if (!min) return bucket.date;
       return new Date(bucket.date) < new Date(min) ? bucket.date : min;
     }, null);
-    return earliest;
   }, [stats]);
   const summaryCards = useMemo<SummaryCard[]>(() => {
     const cards: SummaryCard[] = [
@@ -747,8 +864,45 @@ export default function Dashboard() {
       }
     }
 
+    if (ghostingSummary.totalEvents > 0) {
+      const leaningToOthers = ghostingStats.theyGhostedMe >= ghostingStats.iGhosted;
+      const share = formatPercent(
+        leaningToOthers ? ghostingStats.theyGhostedMe : ghostingStats.iGhosted,
+        ghostingSummary.totalEvents,
+      );
+      items.push({
+        key: "ghosting",
+        label: "Ghosting radar",
+        primary: ghostingSummary.narrative,
+        secondary: `${share} of long silences`,
+        icon: <GhostIcon className="h-4 w-4 text-rose-200" />,
+      });
+    }
+
+    if (conversationSummary.totalStarts > 0) {
+      items.push({
+        key: "conversation-starters",
+        label: "Conversation openers",
+        primary: conversationSummary.narrative,
+        secondary: `${formatPercent(
+          conversationInitiationStats.startedByMe,
+          conversationSummary.totalStarts,
+        )} start with you`,
+        icon: <SparkIcon className="h-4 w-4 text-amber-200" />,
+      });
+    }
+
     return items;
-  }, [attachmentSummary, stats, statsRange, totals.total]);
+  }, [
+    attachmentSummary,
+    conversationInitiationStats,
+    conversationSummary,
+    ghostingStats,
+    ghostingSummary,
+    stats,
+    statsRange,
+    totals.total,
+  ]);
   const insightGridClass = useMemo(() => {
     const count = insightItems.length;
     if (count <= 1) return "grid gap-3 sm:grid-cols-1 max-w-lg mx-auto";
@@ -757,8 +911,8 @@ export default function Dashboard() {
     return "grid gap-3 sm:grid-cols-2 lg:grid-cols-4";
   }, [insightItems.length]);
   const handleStatsRefresh = useCallback(() => {
-    queryClient.invalidateQueries({ queryKey: trpc.stats.summary.queryKey(statsQueryInput) });
-  }, [queryClient, trpc, statsQueryInput]);
+    void refetchStats();
+  }, [refetchStats]);
   const handleOpenReportModal = (chat: ChatSummary) => {
     setReportChat(chat);
     setReportStatus("loading");
@@ -1020,6 +1174,151 @@ export default function Dashboard() {
                     );
                   })}
                 </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
+                      <GhostIcon className="h-4 w-4 text-rose-200" />
+                      <span>Ghosting tendency</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-neutral-400">
+                      <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">They ghosted you</p>
+                        <p className="mt-1 text-2xl font-semibold text-rose-100">
+                          {formatNumber(ghostingStats.theyGhostedMe)}
+                        </p>
+                        {ghostingSummary.theyPercent !== null && (
+                          <p className="text-xs text-neutral-500">{ghostingSummary.theyPercent}% of long silences</p>
+                        )}
+                      </div>
+                      <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">You ghosted them</p>
+                        <p className="mt-1 text-2xl font-semibold text-emerald-100">
+                          {formatNumber(ghostingStats.iGhosted)}
+                        </p>
+                        {ghostingSummary.mePercent !== null && (
+                          <p className="text-xs text-neutral-500">{ghostingSummary.mePercent}% of long silences</p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-4 flex h-2 w-full overflow-hidden rounded-full bg-neutral-900">
+                      <div
+                        className="h-full bg-emerald-400/70"
+                        style={{ width: `${ghostingSummary.mePercent ?? 50}%` }}
+                      />
+                      <div
+                        className="h-full bg-rose-400/80"
+                        style={{ width: `${ghostingSummary.theyPercent ?? 50}%` }}
+                      />
+                    </div>
+                    <p className="mt-3 text-sm text-neutral-200">{ghostingSummary.narrative}</p>
+                    <p className="text-[11px] text-neutral-500">
+                      We count a “ghost” whenever the other side doesn’t reply within {ghostingThresholdLabel}.
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
+                      <SparkIcon className="h-4 w-4 text-amber-200" />
+                      <span>Conversation openers</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-neutral-400">
+                      <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">You start</p>
+                        <p className="mt-1 text-2xl font-semibold text-emerald-100">
+                          {formatNumber(conversationInitiationStats.startedByMe)}
+                        </p>
+                        {conversationSummary.mePercent !== null && (
+                          <p className="text-xs text-neutral-500">{conversationSummary.mePercent}% of sessions</p>
+                        )}
+                      </div>
+                      <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">They start</p>
+                        <p className="mt-1 text-2xl font-semibold text-sky-100">
+                          {formatNumber(conversationInitiationStats.startedByOthers)}
+                        </p>
+                        {conversationSummary.othersPercent !== null && (
+                          <p className="text-xs text-neutral-500">{conversationSummary.othersPercent}% of sessions</p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-4 flex h-2 w-full overflow-hidden rounded-full bg-neutral-900">
+                      <div
+                        className="h-full bg-emerald-400/70"
+                        style={{ width: `${conversationSummary.mePercent ?? 50}%` }}
+                      />
+                      <div
+                        className="h-full bg-sky-400/80"
+                        style={{ width: `${conversationSummary.othersPercent ?? 50}%` }}
+                      />
+                    </div>
+                    <p className="mt-3 text-sm text-neutral-200">{conversationSummary.narrative}</p>
+                    <p className="text-[11px] text-neutral-500">
+                      A new “conversation” begins after {conversationGapLabel} of silence, and we credit whoever sends the
+                      first message after that gap.
+                    </p>
+                  </div>
+                </div>
+                {responseTimes && (
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
+                        <ClockIcon className="h-4 w-4 text-emerald-200" />
+                        <span>Your response time</span>
+                      </div>
+                      <p className="mt-3 text-3xl font-semibold text-emerald-100">{myResponseSummary.median}</p>
+                      <p className="text-xs text-neutral-400">Median reply</p>
+                      <p className="text-xs text-neutral-500">
+                        90% of replies within {myResponseSummary.p90}
+                      </p>
+                      <div className="mt-3 grid grid-cols-2 gap-3 text-[11px] text-neutral-400">
+                        <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
+                          <p className="text-neutral-500">Fastest</p>
+                          <p className="text-neutral-100">{myResponseSummary.fastest}</p>
+                        </div>
+                        <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
+                          <p className="text-neutral-500">Slowest</p>
+                          <p className="text-neutral-100">{myResponseSummary.slowest}</p>
+                        </div>
+                      </div>
+                      <p className="mt-3 text-[11px] text-neutral-500">
+                        {myResponseSummary.samples
+                          ? `${formatNumber(myResponseSummary.samples)} replies measured`
+                          : "No replies measured yet."}
+                      </p>
+                      <p className="text-[11px] text-neutral-600">
+                        Only replies within {conversationGapLabel} count toward this metric.
+                      </p>
+                    </div>
+                    <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
+                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
+                        <ClockIcon className="h-4 w-4 text-sky-200" />
+                        <span>Their response time</span>
+                      </div>
+                      <p className="mt-3 text-3xl font-semibold text-sky-100">{theirResponseSummary.median}</p>
+                      <p className="text-xs text-neutral-400">Median reply</p>
+                      <p className="text-xs text-neutral-500">
+                        90% of replies within {theirResponseSummary.p90}
+                      </p>
+                      <div className="mt-3 grid grid-cols-2 gap-3 text-[11px] text-neutral-400">
+                        <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
+                          <p className="text-neutral-500">Fastest</p>
+                          <p className="text-neutral-100">{theirResponseSummary.fastest}</p>
+                        </div>
+                        <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
+                          <p className="text-neutral-500">Slowest</p>
+                          <p className="text-neutral-100">{theirResponseSummary.slowest}</p>
+                        </div>
+                      </div>
+                      <p className="mt-3 text-[11px] text-neutral-500">
+                        {theirResponseSummary.samples
+                          ? `${formatNumber(theirResponseSummary.samples)} replies measured`
+                          : "No replies measured yet."}
+                      </p>
+                      <p className="text-[11px] text-neutral-600">
+                        Only replies within {conversationGapLabel} count toward this metric.
+                      </p>
+                    </div>
+                  </div>
+                )}
                 {insightItems.length > 0 && (
                   <div className={insightGridClass}>
                     {insightItems.map((insight) => (
@@ -1167,6 +1466,13 @@ export default function Dashboard() {
                           const percentShare = formatPercent(totalMessages, totals.total);
                           const Icon = chat.isGroup ? GroupChatIcon : DirectChatIcon;
                           const iconColor = chat.isGroup ? "text-rose-300" : "text-indigo-300";
+                          const earliestLabel = formatDateTime(chat.firstMessageAt);
+                          const latestLabel = formatDateTime(chat.lastMessageAt);
+                          const chatResponseTimes =
+                            chat.responseTimes ??
+                            createEmptyResponseStatsClient();
+                          const chatMyResponse = chatResponseTimes.meResponding;
+                          const chatTheirResponse = chatResponseTimes.themResponding;
                           const isTopEntry = index === 0;
                           const cardClasses = isTopEntry
                             ? "border-emerald-500/60 bg-gradient-to-r from-emerald-500/15 via-neutral-950/70 to-neutral-950/40 shadow shadow-emerald-500/20"
@@ -1190,7 +1496,9 @@ export default function Dashboard() {
                                   <Icon className={`h-3.5 w-3.5 ${iconColor}`} />
                                   <span>{chat.isGroup ? "Group" : "Chat"}</span>
                                   <span className="text-neutral-700">•</span>
-                                  <span>{formatDateTime(chat.lastMessageAt)}</span>
+                                  <span>Since {earliestLabel}</span>
+                                  <span className="text-neutral-700">•</span>
+                                  <span>Latest {latestLabel}</span>
                                 </div>
                                 {chat.isGroup && (
                                   <button
@@ -1210,17 +1518,75 @@ export default function Dashboard() {
                                 <span className="text-xs text-neutral-400">{percentShare}</span>
                               </div>
                               <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-neutral-400">
-                                <span className="font-semibold text-neutral-100">
-                                  {formatNumber(totalMessages)} messages
-                                </span>
-                                <span className="text-emerald-300">↑ {formatNumber(chat.sentCount)}</span>
-                                <span className="text-sky-300">↓ {formatNumber(chat.receivedCount)}</span>
-                              </div>
-                              {chat.isGroup && chat.participants.length > 0 && (
-                                <p className="mt-1 truncate text-[11px] text-neutral-500">
-                                  {chat.participants.slice(0, 3).join(", ")}
-                                  {chat.participants.length > 3 ? ` +${chat.participants.length - 3}` : ""}
-                                </p>
+                        <span className="font-semibold text-neutral-100">
+                          {formatNumber(totalMessages)} messages
+                        </span>
+                        <span className="text-emerald-300">↑ {formatNumber(chat.sentCount)}</span>
+                        <span className="text-sky-300">↓ {formatNumber(chat.receivedCount)}</span>
+                      </div>
+                              <div className="mt-3 grid gap-2 text-[11px] text-neutral-400 sm:grid-cols-2">
+                                <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
+                                  <div className="flex items-center gap-1 text-neutral-500">
+                                    <GhostIcon className="h-3 w-3 text-rose-200" />
+                                    <span>Ghosting</span>
+                          </div>
+                          <div className="mt-1 flex items-center gap-2">
+                            <span className="text-emerald-200">You {formatNumber(chat.ghosting.iGhosted)}</span>
+                            <span className="text-neutral-600">•</span>
+                            <span className="text-rose-200">Them {formatNumber(chat.ghosting.theyGhostedMe)}</span>
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
+                          <div className="flex items-center gap-1 text-neutral-500">
+                            <SparkIcon className="h-3 w-3 text-amber-200" />
+                            <span>Conversation starts</span>
+                          </div>
+                          <div className="mt-1 flex items-center gap-2">
+                            <span className="text-emerald-200">You {formatNumber(chat.conversationInitiation.startedByMe)}</span>
+                            <span className="text-neutral-600">•</span>
+                            <span className="text-sky-200">Them {formatNumber(chat.conversationInitiation.startedByOthers)}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
+                        <div className="flex items-center gap-1 text-neutral-500">
+                          <ClockIcon className="h-3 w-3 text-sky-200" />
+                          <span>Response time</span>
+                        </div>
+                        <div className="mt-2 grid gap-3 sm:grid-cols-2">
+                          <div>
+                            <p className="text-[10px] uppercase tracking-wide text-neutral-500">You</p>
+                            <p className="text-sm font-semibold text-emerald-100">
+                              {formatResponseDuration(chatMyResponse.medianSeconds)}
+                            </p>
+                            <p className="text-[11px] text-neutral-500">
+                              90% within {formatResponseDuration(chatMyResponse.p90Seconds)}
+                            </p>
+                            <p className="text-[11px] text-neutral-600">
+                              Fast {formatResponseDuration(chatMyResponse.minSeconds)} · Slow{" "}
+                              {formatResponseDuration(chatMyResponse.maxSeconds)}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[10px] uppercase tracking-wide text-neutral-500">Them</p>
+                            <p className="text-sm font-semibold text-sky-100">
+                              {formatResponseDuration(chatTheirResponse.medianSeconds)}
+                            </p>
+                            <p className="text-[11px] text-neutral-500">
+                              90% within {formatResponseDuration(chatTheirResponse.p90Seconds)}
+                            </p>
+                            <p className="text-[11px] text-neutral-600">
+                              Fast {formatResponseDuration(chatTheirResponse.minSeconds)} · Slow{" "}
+                              {formatResponseDuration(chatTheirResponse.maxSeconds)}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                      {chat.isGroup && chat.participants.length > 0 && (
+                        <p className="mt-1 truncate text-[11px] text-neutral-500">
+                          {chat.participants.slice(0, 3).join(", ")}
+                          {chat.participants.length > 3 ? ` +${chat.participants.length - 3}` : ""}
+                        </p>
                               )}
                               {chat.reactions.reactionCount > 0 && (
                                 <div className="mt-2 rounded-md border border-violet-500/10 bg-violet-500/5 px-3 py-2 text-xs text-violet-100/80">

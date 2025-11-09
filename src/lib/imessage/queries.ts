@@ -1,5 +1,6 @@
 import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3";
 import { getContactInfoForHandle, getContactNameForHandle, normalizeHandleIdentifier } from "../contacts";
+import { CONVERSATION_GAP_SECONDS, GHOST_RESPONSE_THRESHOLD_SECONDS } from "./constants";
 import { getDatabase } from "./db";
 import { fromAppleTimestamp, toAppleTimestamp } from "./dates";
 import {
@@ -14,6 +15,8 @@ import {
   type ReactionCountSummary,
   type ReactionTotals,
   type ReactionType,
+  type ResponseStats,
+  type ResponseDirectionStats,
   type SearchOptions,
   type SearchResultMessage,
   type WeekdayCount,
@@ -390,6 +393,31 @@ CASE
   ELSE date(m.date + 978307200, 'unixepoch', 'localtime')
 END
 `;
+const MESSAGE_SECONDS_EXPR = `
+CASE
+  WHEN ABS(m.date) > 1000000000000 THEN (m.date / 1000000000.0) + 978307200
+  WHEN ABS(m.date) > 1000000000 THEN (m.date / 1000000.0) + 978307200
+  ELSE m.date + 978307200
+END
+`;
+
+function createEmptyResponseDirectionStats(): ResponseDirectionStats {
+  return {
+    averageSeconds: null,
+    medianSeconds: null,
+    p90Seconds: null,
+    minSeconds: null,
+    maxSeconds: null,
+    sampleCount: 0,
+  };
+}
+
+function createEmptyResponseStats(): ResponseStats {
+  return {
+    meResponding: createEmptyResponseDirectionStats(),
+    themResponding: createEmptyResponseDirectionStats(),
+  };
+}
 
 export function getConversationStats(options: StatsOptions = {}): ConversationStats {
   const db = getDatabase();
@@ -405,6 +433,8 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const params: Record<string, unknown> = {
     limit,
     participantLimit,
+    conversationGap: CONVERSATION_GAP_SECONDS,
+    ghostThreshold: GHOST_RESPONSE_THRESHOLD_SECONDS,
   };
   const messageWhere: string[] = [];
   if (hasDeletionFlag) {
@@ -439,6 +469,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
         COUNT(m.ROWID) AS messageCount,
         SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
         SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount,
+        MIN(m.date) AS firstMessageDate,
         MAX(m.date) AS lastMessageDate
       FROM chat c
       JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
@@ -479,6 +510,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
       ms.messageCount,
       ms.sentCount,
       ms.receivedCount,
+      ms.firstMessageDate,
       ms.lastMessageDate
     FROM message_stats ms
     LEFT JOIN participants p ON p.chatId = ms.chatId
@@ -558,6 +590,13 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     ${messageWhereSql}
   `;
 
+  const earliestSql = `
+    SELECT
+      MIN(m.date) AS earliestMessageDate
+    FROM message m
+    ${messageWhereSql}
+  `;
+
   const reactionTotalsSql = reactionsSupported
     ? `
     SELECT
@@ -587,6 +626,179 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     ORDER BY attachmentCount DESC
   `
     : null;
+  const conversationDynamicsSql = `
+    WITH ordered AS (
+      SELECT
+        cmj.chat_id AS chatId,
+        m.is_from_me AS isFromMe,
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds,
+        CASE
+          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) IS NULL THEN 1
+          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) != m.is_from_me THEN 1
+          ELSE 0
+        END AS isTurnBreak
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      ${messageWhereSql}
+    ),
+    turns AS (
+      SELECT
+        chatId,
+        isFromMe,
+        turnIndex,
+        MIN(messageSeconds) AS turnStart,
+        MAX(messageSeconds) AS turnEnd
+      FROM (
+        SELECT
+          chatId,
+          isFromMe,
+          SUM(isTurnBreak) OVER (PARTITION BY chatId ORDER BY messageSeconds ROWS UNBOUNDED PRECEDING) AS turnIndex,
+          messageSeconds
+        FROM ordered
+      )
+      GROUP BY chatId, isFromMe, turnIndex
+    ),
+    turn_sequence AS (
+      SELECT
+        chatId,
+        isFromMe,
+        turnStart,
+        turnEnd,
+        LEAD(turnStart) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextTurnStart,
+        LEAD(isFromMe) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextIsFromMe,
+        LAG(turnEnd) OVER (PARTITION BY chatId ORDER BY turnStart) AS prevTurnEnd
+      FROM turns
+    )
+    SELECT
+      chatId,
+      SUM(
+        CASE
+          WHEN isFromMe = 1 AND (nextTurnStart IS NULL OR nextTurnStart - turnEnd >= @ghostThreshold) THEN 1
+          ELSE 0
+        END
+      ) AS iWasGhosted,
+      SUM(
+        CASE
+          WHEN isFromMe = 0 AND (nextTurnStart IS NULL OR nextTurnStart - turnEnd >= @ghostThreshold) THEN 1
+          ELSE 0
+        END
+      ) AS iGhostedSomeone,
+      SUM(
+        CASE
+          WHEN (prevTurnEnd IS NULL OR turnStart - prevTurnEnd >= @conversationGap) AND isFromMe = 1 THEN 1
+          ELSE 0
+        END
+      ) AS conversationsStartedByMe,
+      SUM(
+        CASE
+          WHEN (prevTurnEnd IS NULL OR turnStart - prevTurnEnd >= @conversationGap) AND isFromMe = 0 THEN 1
+          ELSE 0
+        END
+      ) AS conversationsStartedByOthers
+    FROM turn_sequence
+    GROUP BY chatId
+  `;
+  const responseStatsSql = `
+    WITH ordered AS (
+      SELECT
+        cmj.chat_id AS chatId,
+        m.is_from_me AS isFromMe,
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds,
+        CASE
+          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) IS NULL THEN 1
+          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) != m.is_from_me THEN 1
+          ELSE 0
+        END AS isTurnBreak
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      ${messageWhereSql}
+    ),
+    turns AS (
+      SELECT
+        chatId,
+        isFromMe,
+        turnIndex,
+        MIN(messageSeconds) AS turnStart,
+        MAX(messageSeconds) AS turnEnd
+      FROM (
+        SELECT
+          chatId,
+          isFromMe,
+          SUM(isTurnBreak) OVER (PARTITION BY chatId ORDER BY messageSeconds ROWS UNBOUNDED PRECEDING) AS turnIndex,
+          messageSeconds
+        FROM ordered
+      )
+      GROUP BY chatId, isFromMe, turnIndex
+    ),
+    turn_sequence AS (
+      SELECT
+        chatId,
+        isFromMe,
+        turnStart,
+        turnEnd,
+        LEAD(turnStart) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextTurnStart,
+        LEAD(isFromMe) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextIsFromMe
+      FROM turns
+    ),
+    responses AS (
+      SELECT
+        chatId,
+        CASE
+          WHEN isFromMe = 0 AND nextIsFromMe = 1 THEN 1
+          WHEN isFromMe = 1 AND nextIsFromMe = 0 THEN 0
+        END AS responderIsMe,
+        nextTurnStart - turnEnd AS responseSeconds
+      FROM turn_sequence
+      WHERE nextTurnStart IS NOT NULL
+        AND nextIsFromMe IS NOT NULL
+        AND nextIsFromMe != isFromMe
+        AND nextTurnStart - turnEnd > 0
+        AND nextTurnStart - turnEnd < @conversationGap
+    ),
+    responses_clean AS (
+      SELECT chatId, responderIsMe, responseSeconds
+      FROM responses
+      WHERE responderIsMe IS NOT NULL
+    ),
+    ranked AS (
+      SELECT
+        chatId,
+        responderIsMe,
+        responseSeconds,
+        ROW_NUMBER() OVER (PARTITION BY chatId, responderIsMe ORDER BY responseSeconds) AS rn,
+        COUNT(*) OVER (PARTITION BY chatId, responderIsMe) AS cnt
+      FROM responses_clean
+      UNION ALL
+      SELECT
+        NULL AS chatId,
+        responderIsMe,
+        responseSeconds,
+        ROW_NUMBER() OVER (PARTITION BY responderIsMe ORDER BY responseSeconds) AS rn,
+        COUNT(*) OVER (PARTITION BY responderIsMe) AS cnt
+      FROM responses_clean
+    )
+    SELECT
+      chatId,
+      responderIsMe,
+      MAX(cnt) AS sampleCount,
+      AVG(responseSeconds) AS averageSeconds,
+      MIN(responseSeconds) AS minSeconds,
+      MAX(responseSeconds) AS maxSeconds,
+      SUM(
+        CASE
+          WHEN cnt % 2 = 1 AND rn = (cnt + 1) / 2 THEN responseSeconds
+          WHEN cnt % 2 = 0 AND rn IN (cnt / 2, cnt / 2 + 1) THEN responseSeconds / 2.0
+          ELSE 0
+        END
+      ) AS medianSeconds,
+      MIN(
+        CASE
+          WHEN rn = ((cnt * 9 + 9) / 10) THEN responseSeconds
+        END
+      ) AS p90Seconds
+    FROM ranked
+    GROUP BY chatId, responderIsMe
+  `;
 
   const topChatsStmt = db.prepare(topChatsSql);
   const participantStmt = db.prepare(participantSql);
@@ -594,8 +806,11 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const hourlyStmt = db.prepare(hourlySql);
   const weekdayStmt = db.prepare(weekdaySql);
   const totalsStmt = db.prepare(totalsSql);
+  const earliestStmt = db.prepare(earliestSql);
   const reactionTotalsStmt = reactionTotalsSql ? db.prepare(reactionTotalsSql) : null;
   const attachmentStmt = attachmentsSql ? db.prepare(attachmentsSql) : null;
+  const conversationDynamicsStmt = db.prepare(conversationDynamicsSql);
+  const responseStatsStmt = db.prepare(responseStatsSql);
 
   const topChatsRows = topChatsStmt.all(params) as {
     chatId: number;
@@ -605,6 +820,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     messageCount: number;
     sentCount: number;
     receivedCount: number;
+    firstMessageDate: number | null;
     lastMessageDate: number | null;
   }[];
 
@@ -640,6 +856,26 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     receivedCount: number | null;
     latestMessageDate: number | null;
   } | undefined;
+  const earliestRow = earliestStmt.get(params) as {
+    earliestMessageDate: number | null;
+  } | undefined;
+  const conversationDynamicsRows = conversationDynamicsStmt.all(params) as Array<{
+    chatId: number | null;
+    iWasGhosted: number | null;
+    iGhostedSomeone: number | null;
+    conversationsStartedByMe: number | null;
+    conversationsStartedByOthers: number | null;
+  }>;
+  const responseStatsRows = responseStatsStmt.all(params) as Array<{
+    chatId: number | null;
+    responderIsMe: number;
+    sampleCount: number | null;
+    averageSeconds: number | null;
+    minSeconds: number | null;
+    maxSeconds: number | null;
+    medianSeconds: number | null;
+    p90Seconds: number | null;
+  }>;
   const totals = {
     messageCount: totalsRow?.messageCount ?? 0,
     sentCount: totalsRow?.sentCount ?? 0,
@@ -710,7 +946,56 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
       }
     });
   }
+  const earliestMessageAt = fromAppleTimestamp(earliestRow?.earliestMessageDate ?? null);
   const latestMessageAt = fromAppleTimestamp(totalsRow?.latestMessageDate ?? null);
+  const conversationDynamicsByChat = new Map<
+    number,
+    {
+      ghosting: GhostingStats;
+      conversationInitiation: ConversationInitiationStats;
+    }
+  >();
+  const ghostingStats: GhostingStats = { iGhosted: 0, theyGhostedMe: 0 };
+  const conversationInitiation: ConversationInitiationStats = { startedByMe: 0, startedByOthers: 0 };
+  for (const row of conversationDynamicsRows) {
+    if (!row || row.chatId === null || row.chatId === undefined) continue;
+    const ghosting = {
+      iGhosted: row.iGhostedSomeone ?? 0,
+      theyGhostedMe: row.iWasGhosted ?? 0,
+    };
+    const conversation = {
+      startedByMe: row.conversationsStartedByMe ?? 0,
+      startedByOthers: row.conversationsStartedByOthers ?? 0,
+    };
+    ghostingStats.iGhosted += ghosting.iGhosted;
+    ghostingStats.theyGhostedMe += ghosting.theyGhostedMe;
+    conversationInitiation.startedByMe += conversation.startedByMe;
+    conversationInitiation.startedByOthers += conversation.startedByOthers;
+    conversationDynamicsByChat.set(row.chatId, {
+      ghosting,
+      conversationInitiation: conversation,
+    });
+  }
+  const responseStatsByChat = new Map<number, ResponseStats>();
+  const overallResponseTimes = createEmptyResponseStats();
+  for (const row of responseStatsRows) {
+    const responderKey = row.responderIsMe === 1 ? "meResponding" : "themResponding";
+    const directionStats: ResponseDirectionStats = {
+      averageSeconds: row.averageSeconds ?? null,
+      medianSeconds: row.medianSeconds ?? null,
+      p90Seconds: row.p90Seconds ?? null,
+      minSeconds: row.minSeconds ?? null,
+      maxSeconds: row.maxSeconds ?? null,
+      sampleCount: row.sampleCount ?? 0,
+    };
+    if (row.chatId === null) {
+      overallResponseTimes[responderKey] = directionStats;
+      continue;
+    }
+    const existing = responseStatsByChat.get(row.chatId) ?? createEmptyResponseStats();
+    existing[responderKey] = directionStats;
+    responseStatsByChat.set(row.chatId, existing);
+  }
   const reactionTotalsByChat = new Map<number, ReactionTotals>();
   const reactionParticipantsByChat = new Map<number, ChatReactionParticipantStats[]>();
   const messageParticipantsByChat = new Map<number, ChatParticipantStats[]>();
@@ -954,6 +1239,9 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     const chatReactions: ReactionTotals = reactionTotalsByChat.get(row.chatId) ?? createEmptyReactionTotals();
     const chatReactionParticipants = reactionParticipantsByChat.get(row.chatId) ?? [];
 
+    const dynamics = conversationDynamicsByChat.get(row.chatId);
+    const chatResponseTimes = responseStatsByChat.get(row.chatId) ?? createEmptyResponseStats();
+
     return {
       chatId: row.chatId,
       chatDisplayName: derivedName,
@@ -962,7 +1250,11 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
       messageCount: row.messageCount,
       sentCount: row.sentCount,
       receivedCount: row.receivedCount,
+      firstMessageAt: fromAppleTimestamp(row.firstMessageDate),
       lastMessageAt: fromAppleTimestamp(row.lastMessageDate),
+      ghosting: dynamics?.ghosting ?? { iGhosted: 0, theyGhostedMe: 0 },
+      conversationInitiation: dynamics?.conversationInitiation ?? { startedByMe: 0, startedByOthers: 0 },
+      responseTimes: chatResponseTimes,
       reactions: chatReactions,
       reactionParticipants: chatReactionParticipants,
       messageParticipants: messageParticipantsByChat.get(row.chatId) ?? [],
@@ -1042,7 +1334,11 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     totals,
     reactionTotals,
     attachmentStats,
+    earliestMessageAt,
     latestMessageAt,
+    ghosting: ghostingStats,
+    conversationInitiation,
+    responseTimes: overallResponseTimes,
   };
 }
 

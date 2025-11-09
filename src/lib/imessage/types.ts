@@ -50,6 +50,30 @@ export interface ReactionTotals extends ReactionCountSummary {
   byType: ReactionBreakdown;
 }
 
+export interface GhostingStats {
+  iGhosted: number;
+  theyGhostedMe: number;
+}
+
+export interface ConversationInitiationStats {
+  startedByMe: number;
+  startedByOthers: number;
+}
+
+export interface ResponseDirectionStats {
+  averageSeconds: number | null;
+  medianSeconds: number | null;
+  p90Seconds: number | null;
+  minSeconds: number | null;
+  maxSeconds: number | null;
+  sampleCount: number;
+}
+
+export interface ResponseStats {
+  meResponding: ResponseDirectionStats;
+  themResponding: ResponseDirectionStats;
+}
+
 export interface AttachmentTopSender {
   id: string | null;
   displayName: string | null;
@@ -79,7 +103,11 @@ export interface ChatSummary {
   messageCount: number;
   sentCount: number;
   receivedCount: number;
+  firstMessageAt: Date | null;
   lastMessageAt: Date | null;
+  ghosting: GhostingStats;
+  conversationInitiation: ConversationInitiationStats;
+  responseTimes: ResponseStats;
   reactions: ReactionTotals;
   reactionParticipants: ChatReactionParticipantStats[];
   messageParticipants: ChatParticipantStats[];
@@ -118,10 +146,15 @@ export interface ConversationStats {
   totals: MessageTotals;
   reactionTotals: ReactionTotals;
   attachmentStats: AttachmentStats;
+  earliestMessageAt: Date | null;
   latestMessageAt: Date | null;
+  ghosting: GhostingStats;
+  conversationInitiation: ConversationInitiationStats;
+  responseTimes: ResponseStats;
 }
 
-export type SerializableChatSummary = Omit<ChatSummary, "lastMessageAt"> & {
+export type SerializableChatSummary = Omit<ChatSummary, "lastMessageAt" | "firstMessageAt"> & {
+  firstMessageAt: string | null;
   lastMessageAt: string | null;
 };
 
@@ -131,9 +164,10 @@ export type SerializableDailyCount = Omit<DailyCount, "date"> & {
 
 export type SerializableConversationStats = Omit<
   ConversationStats,
-  "topChats" | "dailyCounts" | "latestMessageAt"
+  "topChats" | "dailyCounts" | "latestMessageAt" | "earliestMessageAt"
 > & {
   topChats: SerializableChatSummary[];
   dailyCounts: SerializableDailyCount[];
   latestMessageAt: string | null;
+  earliestMessageAt: string | null;
 };
