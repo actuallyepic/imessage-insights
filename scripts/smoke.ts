@@ -84,6 +84,7 @@ async function main() {
             topContact: stats.participantBreakdown[0],
             dailySample: stats.dailyCounts.slice(0, 3),
             hourlySample: stats.hourlyCounts.slice(0, 3),
+            reactionTotals: stats.reactionTotals,
           },
           null,
           2,

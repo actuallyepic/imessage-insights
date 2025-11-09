@@ -18,6 +18,8 @@ export interface MockMessage {
   text: string;
   isFromMe: boolean;
   sentAt: Date;
+  associatedMessageGuid?: string | null;
+  associatedMessageType?: number | null;
 }
 
 export interface MockChat {
@@ -77,6 +79,26 @@ const DEFAULT_MESSAGES: MockMessage[] = [
     text: "Thank you! Appreciate it.",
     isFromMe: true,
     sentAt: new Date("2024-07-15T15:02:00Z"),
+  },
+  {
+    guid: "msg-5",
+    chatGuid: "chat1",
+    handleId: "+15555550101",
+    text: "Loved “Yes! 7pm at the usual spot.”",
+    isFromMe: false,
+    sentAt: new Date("2024-08-01T18:31:30Z"),
+    associatedMessageGuid: "msg-2",
+    associatedMessageType: 2000,
+  },
+  {
+    guid: "msg-6",
+    chatGuid: "chat1",
+    handleId: null,
+    text: "Liked “Are we still on for dinner tonight?”",
+    isFromMe: true,
+    sentAt: new Date("2024-08-01T18:32:00Z"),
+    associatedMessageGuid: "msg-1",
+    associatedMessageType: 2001,
   },
 ];
 
@@ -141,6 +163,8 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       date_read INTEGER,
       date_delivered INTEGER,
       is_from_me INTEGER,
+      associated_message_guid TEXT,
+      associated_message_type INTEGER,
       cache_has_attachments INTEGER DEFAULT 0
     );
 
@@ -200,8 +224,26 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
   });
 
   const insertMessage = db.prepare(`
-    INSERT INTO message (ROWID, guid, handle_id, text, date, is_from_me)
-    VALUES (@rowId, @guid, @handleId, @text, @date, @isFromMe)
+    INSERT INTO message (
+      ROWID,
+      guid,
+      handle_id,
+      text,
+      date,
+      is_from_me,
+      associated_message_guid,
+      associated_message_type
+    )
+    VALUES (
+      @rowId,
+      @guid,
+      @handleId,
+      @text,
+      @date,
+      @isFromMe,
+      @associatedMessageGuid,
+      @associatedMessageType
+    )
   `);
 
   const insertChatMessageJoin = db.prepare(`
@@ -228,6 +270,8 @@ export function createMockDb(options: CreateMockDbOptions = {}): {
       text: message.text,
       date: toAppleTimestamp(message.sentAt),
       isFromMe: message.isFromMe ? 1 : 0,
+      associatedMessageGuid: message.associatedMessageGuid ?? null,
+      associatedMessageType: message.associatedMessageType ?? null,
     });
 
     insertChatMessageJoin.run({

@@ -11,6 +11,9 @@ interface ChatSummary {
   sentCount: number;
   receivedCount: number;
   lastMessageAt: string | null;
+  reactions: ReactionTotals;
+  reactionParticipants: ChatReactionParticipant[];
+  messageParticipants: ParticipantStats[];
 }
 
 interface ParticipantStats {
@@ -19,6 +22,7 @@ interface ParticipantStats {
   messageCount: number;
   sentCount: number;
   receivedCount: number;
+  isMe?: boolean;
 }
 
 interface DailyCount {
@@ -45,6 +49,19 @@ interface MessageTotals {
   receivedCount: number;
 }
 
+interface ReactionTotals {
+  reactionCount: number;
+  sentCount: number;
+  receivedCount: number;
+}
+
+interface ChatReactionParticipant {
+  id: string;
+  displayName: string | null;
+  reactionCount: number;
+  isMe: boolean;
+}
+
 interface ConversationStats {
   topChats: ChatSummary[];
   participantBreakdown: ParticipantStats[];
@@ -52,6 +69,7 @@ interface ConversationStats {
   hourlyCounts: HourlyCount[];
   weekdayCounts: WeekdayCount[];
   totals: MessageTotals;
+  reactionTotals: ReactionTotals;
   latestMessageAt: string | null;
 }
 
@@ -169,6 +187,17 @@ function GroupChatIcon({ className }: IconProps) {
   );
 }
 
+function ReactionIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" className={className} role="img">
+      <path
+        fill="currentColor"
+        d="M12 21C12 21 4 13.22 4 8.5C4 5.42 6.42 3 9.5 3C11.04 3 12.54 3.81 13.25 5.08C13.96 3.81 15.46 3 17 3C20.08 3 22.5 5.42 22.5 8.5C22.5 13.22 14.5 21 14.5 21H12Z"
+      />
+    </svg>
+  );
+}
+
 type ChatFilterMode = "all" | "direct" | "group";
 
 const chatFilterOptions: { value: ChatFilterMode; label: string }[] = [
@@ -188,6 +217,9 @@ export default function Dashboard() {
   const [activityView, setActivityView] = useState<"hourly" | "weekday">("hourly");
   const [accessError, setAccessError] = useState(false);
   const [accessTipDismissed, setAccessTipDismissed] = useState(false);
+  const [expandedChatSections, setExpandedChatSections] = useState<
+    Record<number, { messages: boolean; reactions: boolean }>
+  >({});
 
   const totals = useMemo(() => computeTotals(stats), [stats]);
   const sampledDayCount = stats?.dailyCounts.length ?? 0;
@@ -208,6 +240,15 @@ export default function Dashboard() {
     }
   }, [chatFilterMode, stats]);
   const topChatPreview = filteredTopChats.slice(0, visibleChatCount);
+  const reactionTotalsSummary = stats?.reactionTotals ?? null;
+  const averageSentPerDay = useMemo(() => {
+    if (!stats || sampledDayCount === 0) return null;
+    return Math.max(0, Math.round(stats.totals.sentCount / sampledDayCount));
+  }, [sampledDayCount, stats]);
+  const averageReceivedPerDay = useMemo(() => {
+    if (!stats || sampledDayCount === 0) return null;
+    return Math.max(0, Math.round(stats.totals.receivedCount / sampledDayCount));
+  }, [sampledDayCount, stats]);
   const summaryCards = useMemo(
     () => [
       {
@@ -231,9 +272,30 @@ export default function Dashboard() {
         key: "pace",
         label: "Daily average",
         value: averagePerDay ? formatNumber(averagePerDay) : "—",
+        detail:
+          averageSentPerDay !== null && averageReceivedPerDay !== null
+            ? `↑ ${formatNumber(averageSentPerDay)} sent · ↓ ${formatNumber(averageReceivedPerDay)} received`
+            : undefined,
+      },
+      {
+        key: "reactions",
+        label: "Reactions",
+        value: reactionTotalsSummary?.reactionCount ? formatNumber(reactionTotalsSummary.reactionCount) : "—",
+        detail:
+          reactionTotalsSummary && reactionTotalsSummary.reactionCount
+            ? `↑ ${formatNumber(reactionTotalsSummary.sentCount)} sent · ↓ ${formatNumber(reactionTotalsSummary.receivedCount)} received`
+            : undefined,
       },
     ],
-    [averagePerDay, totals.received, totals.sent, totals.total],
+    [
+      averagePerDay,
+      averageReceivedPerDay,
+      averageSentPerDay,
+      reactionTotalsSummary,
+      totals.received,
+      totals.sent,
+      totals.total,
+    ],
   );
 
   const summaryCardStyles: Record<
@@ -255,6 +317,11 @@ export default function Dashboard() {
       valueClass: "text-sky-300",
       badgeClass: "text-sky-300",
     },
+    reactions: {
+      wrapper: "border-rose-500/30 bg-rose-500/5",
+      valueClass: "text-rose-200",
+      badgeClass: "text-rose-200",
+    },
     pace: {
       wrapper: "border-amber-400/30 bg-amber-500/5",
       valueClass: "text-amber-200",
@@ -262,6 +329,18 @@ export default function Dashboard() {
     },
   };
   const handleStatsRefresh = () => setStatsRefreshToken((token) => token + 1);
+  const toggleChatSection = (chatId: number, section: "messages" | "reactions") => {
+    setExpandedChatSections((prev) => {
+      const current = prev[chatId] ?? { messages: false, reactions: false };
+      return {
+        ...prev,
+        [chatId]: {
+          ...current,
+          [section]: !current[section],
+        },
+      };
+    });
+  };
 
   const hourlyMax = useMemo(() => {
     if (!stats || stats.hourlyCounts.length === 0) return 0;
@@ -445,7 +524,7 @@ export default function Dashboard() {
                   statsLoading ? "opacity-60" : "opacity-100"
                 }`}
               >
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
                   {summaryCards.map((card) => (
                     <div
                       key={card.key}
@@ -470,6 +549,15 @@ export default function Dashboard() {
                           </span>
                         )}
                       </p>
+                      {card.detail && (
+                        <span
+                          className={`mt-1 block text-sm font-semibold ${
+                            (summaryCardStyles[card.key] ?? summaryCardStyles.total).badgeClass
+                          }`}
+                        >
+                          {card.detail}
+                        </span>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -531,6 +619,12 @@ export default function Dashboard() {
                           const cardClasses = isTopEntry
                             ? "border-emerald-500/60 bg-gradient-to-r from-emerald-500/15 via-neutral-950/70 to-neutral-950/40 shadow shadow-emerald-500/20"
                             : "border-neutral-800 bg-neutral-950/70";
+                          const expandedSectionsForChat = expandedChatSections[chat.chatId] ?? {
+                            messages: false,
+                            reactions: false,
+                          };
+                          const messagesExpanded = expandedSectionsForChat.messages;
+                          const reactionsExpanded = expandedSectionsForChat.reactions;
                           return (
                             <div
                               key={chat.chatId}
@@ -555,6 +649,101 @@ export default function Dashboard() {
                                 <span className="text-emerald-300">↑ {formatNumber(chat.sentCount)}</span>
                                 <span className="text-sky-300">↓ {formatNumber(chat.receivedCount)}</span>
                               </div>
+                              {chat.reactions.reactionCount > 0 && (
+                                <div className="mt-2 flex flex-wrap items-center gap-3 rounded-md border border-rose-500/10 bg-rose-500/5 px-3 py-2 text-xs text-rose-100/80">
+                                  <span className="flex items-center gap-1 text-rose-200">
+                                    <ReactionIcon className="h-3.5 w-3.5" />
+                                    {formatNumber(chat.reactions.reactionCount)} reactions
+                                  </span>
+                                  <span className="text-emerald-300">↑ {formatNumber(chat.reactions.sentCount)}</span>
+                                  <span className="text-sky-300">↓ {formatNumber(chat.reactions.receivedCount)}</span>
+                                </div>
+                              )}
+                              {chat.isGroup && chat.messageParticipants.length > 0 && (
+                                <div className="mt-3 rounded-md border border-neutral-800/60 bg-neutral-900/60 px-3 py-2">
+                                  <div className="flex items-center justify-between">
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                                      Messages by member
+                                    </p>
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleChatSection(chat.chatId, "messages")}
+                                      className="text-[11px] font-semibold text-emerald-200 hover:text-emerald-100"
+                                    >
+                                      {messagesExpanded ? "Hide" : "Show"}
+                                    </button>
+                                  </div>
+                                  {messagesExpanded && (
+                                    <ul className="mt-2 space-y-1.5">
+                                      {chat.messageParticipants.map((participant) => {
+                                        const isSelf = Boolean(participant.isMe || participant.id === "me");
+                                        const nameClasses = isSelf
+                                          ? "font-semibold text-emerald-200"
+                                          : "text-neutral-200";
+                                        return (
+                                          <li
+                                            key={`${chat.chatId}-${participant.id}`}
+                                            className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-200"
+                                          >
+                                            <span className={`flex items-center gap-2 ${nameClasses}`}>
+                                              {participant.displayName ?? "Unknown"}
+                                            </span>
+                                            <div className="flex items-center gap-3">
+                                              <span className="font-semibold text-neutral-100">
+                                                {formatNumber(participant.messageCount)} msgs
+                                              </span>
+                                              <span className="text-emerald-300">
+                                                ↑ {formatNumber(participant.sentCount)}
+                                              </span>
+                                              <span className="text-sky-300">
+                                                ↓ {formatNumber(participant.receivedCount)}
+                                              </span>
+                                            </div>
+                                          </li>
+                                        );
+                                      })}
+                                    </ul>
+                                  )}
+                                </div>
+                              )}
+                              {chat.isGroup && chat.reactionParticipants.length > 0 && (
+                                <div className="mt-3 rounded-md border border-neutral-800/60 bg-neutral-900/60 px-3 py-2">
+                                  <div className="flex items-center justify-between">
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                                      Reactions by member
+                                    </p>
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleChatSection(chat.chatId, "reactions")}
+                                      className="text-[11px] font-semibold text-emerald-200 hover:text-emerald-100"
+                                    >
+                                      {reactionsExpanded ? "Hide" : "Show"}
+                                    </button>
+                                  </div>
+                                  {reactionsExpanded && (
+                                    <ul className="mt-2 space-y-1.5">
+                                      {chat.reactionParticipants.map((participant) => {
+                                        const nameClasses = participant.isMe
+                                          ? "font-semibold text-emerald-200"
+                                          : "text-neutral-200";
+                                        return (
+                                          <li
+                                            key={`${chat.chatId}-${participant.id}`}
+                                            className="flex items-center justify-between text-xs text-neutral-200"
+                                          >
+                                            <span className={`flex items-center gap-2 ${nameClasses}`}>
+                                              {participant.displayName ?? "Unknown"}
+                                            </span>
+                                            <span className="font-semibold text-rose-200">
+                                              {formatNumber(participant.reactionCount)}
+                                            </span>
+                                          </li>
+                                        );
+                                      })}
+                                    </ul>
+                                  )}
+                                </div>
+                              )}
                             </div>
                           );
                         })

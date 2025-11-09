@@ -31,6 +31,20 @@ export interface ChatParticipantStats {
   messageCount: number;
   sentCount: number;
   receivedCount: number;
+  isMe?: boolean;
+}
+
+export interface ReactionTotals {
+  reactionCount: number;
+  sentCount: number;
+  receivedCount: number;
+}
+
+export interface ChatReactionParticipantStats {
+  id: string;
+  displayName: string | null;
+  reactionCount: number;
+  isMe: boolean;
 }
 
 export interface ChatSummary {
@@ -42,6 +56,9 @@ export interface ChatSummary {
   sentCount: number;
   receivedCount: number;
   lastMessageAt: Date | null;
+  reactions: ReactionTotals;
+  reactionParticipants: ChatReactionParticipantStats[];
+  messageParticipants: ChatParticipantStats[];
 }
 
 export interface DailyCount {
@@ -75,5 +92,6 @@ export interface ConversationStats {
   hourlyCounts: HourlyCount[];
   weekdayCounts: WeekdayCount[];
   totals: MessageTotals;
+  reactionTotals: ReactionTotals;
   latestMessageAt: Date | null;
 }
