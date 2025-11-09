@@ -62,10 +62,18 @@ export interface WeekdayCount {
   receivedCount: number;
 }
 
+export interface MessageTotals {
+  messageCount: number;
+  sentCount: number;
+  receivedCount: number;
+}
+
 export interface ConversationStats {
   topChats: ChatSummary[];
   participantBreakdown: ChatParticipantStats[];
   dailyCounts: DailyCount[];
   hourlyCounts: HourlyCount[];
   weekdayCounts: WeekdayCount[];
+  totals: MessageTotals;
+  latestMessageAt: Date | null;
 }

@@ -2,16 +2,6 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-interface SearchResult {
-  messageId: number;
-  chatId: number;
-  chatDisplayName: string | null;
-  participants: string[];
-  text: string | null;
-  isFromMe: boolean;
-  sentAt: string | null;
-}
-
 interface ChatSummary {
   chatId: number;
   chatDisplayName: string | null;
@@ -49,15 +39,23 @@ interface WeekdayCount {
   receivedCount: number;
 }
 
+interface MessageTotals {
+  messageCount: number;
+  sentCount: number;
+  receivedCount: number;
+}
+
 interface ConversationStats {
   topChats: ChatSummary[];
   participantBreakdown: ParticipantStats[];
   dailyCounts: DailyCount[];
   hourlyCounts: HourlyCount[];
   weekdayCounts: WeekdayCount[];
+  totals: MessageTotals;
+  latestMessageAt: string | null;
 }
 
-type StatsRange = "30d" | "90d" | "all";
+type StatsRange = "1h" | "6h" | "12h" | "1d" | "3d" | "5d" | "7d" | "30d" | "90d" | "all";
 
 function formatDateTime(value: string | null) {
   if (!value) return "Unknown";
@@ -66,11 +64,11 @@ function formatDateTime(value: string | null) {
   return date.toLocaleString();
 }
 
-function formatParticipants(chat: ChatSummary | SearchResult) {
-  if ("participants" in chat && chat.participants.length > 0) {
+function formatParticipants(chat: ChatSummary) {
+  if (chat.participants.length > 0) {
     return chat.participants.join(", ");
   }
-  if ("chatDisplayName" in chat && chat.chatDisplayName) {
+  if (chat.chatDisplayName) {
     return chat.chatDisplayName;
   }
   return "(unknown)";
@@ -80,77 +78,190 @@ function formatNumber(value: number) {
   return value.toLocaleString();
 }
 
-function highlightText(text: string | null, query: string) {
-  if (!text) return <span className="italic text-neutral-500">[no text]</span>;
-  const trimmed = query.trim();
-  if (!trimmed) return text;
-
-  try {
-    const pattern = new RegExp(`(${trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
-    const parts = text.split(pattern);
-    return parts.map((part, index) =>
-      index % 2 === 1 ? (
-        <mark key={`${part}-${index}`} className="rounded bg-amber-200 px-1 py-0.5 text-neutral-900">
-          {part}
-        </mark>
-      ) : (
-        <span key={`${part}-${index}`}>{part}</span>
-      ),
-    );
-  } catch {
-    return text;
+function formatPercent(part: number, total: number) {
+  if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0 || part <= 0) {
+    return "0%";
   }
+  const percentage = (part / total) * 100;
+  return `${Math.round(percentage)}%`;
 }
 
 function computeTotals(stats: ConversationStats | null) {
   if (!stats) return { sent: 0, received: 0, total: 0 };
-  const sent = stats.topChats.reduce((acc, chat) => acc + chat.sentCount, 0);
-  const received = stats.topChats.reduce((acc, chat) => acc + chat.receivedCount, 0);
-  return { sent, received, total: sent + received };
+  const { sentCount, receivedCount, messageCount } = stats.totals;
+  return { sent: sentCount, received: receivedCount, total: messageCount };
 }
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+const rangeDurations: Record<Exclude<StatsRange, "all">, number> = {
+  "1h": 1 * HOUR_MS,
+  "6h": 6 * HOUR_MS,
+  "12h": 12 * HOUR_MS,
+  "1d": 1 * DAY_MS,
+  "3d": 3 * DAY_MS,
+  "5d": 5 * DAY_MS,
+  "7d": 7 * DAY_MS,
+  "30d": 30 * DAY_MS,
+  "90d": 90 * DAY_MS,
+};
+
+const statsRangeOptions: StatsRange[] = ["1h", "6h", "12h", "1d", "3d", "5d", "7d", "30d", "90d", "all"];
+const DEFAULT_STATS_LIMIT = 40;
+const CHAT_COUNT_OPTIONS = [5, 10, 20, 30];
+const ACCESS_TIP_STORAGE_KEY = "imessage-insights:fda-tip-dismissed";
 
 function getRangeDates(range: StatsRange) {
   if (range === "all") return {};
   const now = new Date();
-  const days = range === "30d" ? 30 : 90;
-  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
-  return { start: start.toISOString().slice(0, 10), end: now.toISOString().slice(0, 10) };
+  const duration = rangeDurations[range];
+  const start = new Date(now.getTime() - duration);
+  return { start: start.toISOString(), end: now.toISOString() };
 }
 
 const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-type SearchRequest = {
-  q: string;
-  chatId?: string;
-  fromMe: boolean;
-  fromOthers: boolean;
-  start?: string;
-  end?: string;
+type IconProps = {
+  className?: string;
 };
 
-const PAGE_SIZE = 200;
+function Spinner({ className }: { className?: string }) {
+  return (
+    <span
+      className={`inline-block h-4 w-4 animate-spin rounded-full border-2 border-neutral-600 border-t-transparent ${className ?? ""}`}
+      aria-hidden="true"
+    />
+  );
+}
+
+function DirectChatIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 448 512"
+      aria-hidden="true"
+      focusable="false"
+      className={className}
+      role="img"
+    >
+      <path
+        fill="currentColor"
+        d="M224 256A128 128 0 1 0 224 0a128 128 0 1 0 0 256zm-90.7 32C59.9 288 0 347.9 0 421.3 0 456.2 27.8 484 62.7 484H385.3c34.9 0 62.7-27.8 62.7-62.7 0-73.4-59.9-133.3-133.3-133.3H133.3z"
+      />
+    </svg>
+  );
+}
+
+function GroupChatIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 640 512"
+      aria-hidden="true"
+      focusable="false"
+      className={className}
+      role="img"
+    >
+      <path
+        fill="currentColor"
+        d="M96 128a64 64 0 1 1 128 0A64 64 0 1 1 96 128zm224 0a64 64 0 1 1 128 0A64 64 0 1 1 320 128zM0 416c0-88.4 71.6-160 160-160h64c88.4 0 160 71.6 160 160 0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zm416-160h-8.6c51.1 23.3 87.1 74.4 87.1 133.3 0 21.2-17.2 38.7-38.7 38.7H480c88.4 0 160-71.6 160-160 0-70.7-57.3-128-128-128h-32c-13 0-25.6-2.6-37.1-7.5 2.7 7.7 4.1 15.9 4.1 24.5v32c0 35.3-28.7 64-64 64z"
+      />
+    </svg>
+  );
+}
+
+type ChatFilterMode = "all" | "direct" | "group";
+
+const chatFilterOptions: { value: ChatFilterMode; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "direct", label: "Chats" },
+  { value: "group", label: "Groups" },
+];
 
 export default function Dashboard() {
-  const [query, setQuery] = useState("");
-  const [chatId, setChatId] = useState("");
-  const [fromMe, setFromMe] = useState(true);
-  const [fromOthers, setFromOthers] = useState(true);
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
-
-  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [loadMoreLoading, setLoadMoreLoading] = useState(false);
-  const [searchError, setSearchError] = useState<string | null>(null);
-  const [hasMoreSearchResults, setHasMoreSearchResults] = useState(false);
-  const [lastSearchRequest, setLastSearchRequest] = useState<SearchRequest | null>(null);
-
-  const [statsRange, setStatsRange] = useState<StatsRange>("90d");
+  const [statsRange, setStatsRange] = useState<StatsRange>("all");
   const [stats, setStats] = useState<ConversationStats | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
   const [statsError, setStatsError] = useState<string | null>(null);
+  const [chatFilterMode, setChatFilterMode] = useState<ChatFilterMode>("all");
+  const [visibleChatCount, setVisibleChatCount] = useState(5);
+  const [statsRefreshToken, setStatsRefreshToken] = useState(0);
+  const [activityView, setActivityView] = useState<"hourly" | "weekday">("hourly");
+  const [accessError, setAccessError] = useState(false);
+  const [accessTipDismissed, setAccessTipDismissed] = useState(false);
 
   const totals = useMemo(() => computeTotals(stats), [stats]);
+  const sampledDayCount = stats?.dailyCounts.length ?? 0;
+  const averagePerDay = useMemo(() => {
+    if (!stats || sampledDayCount === 0) return null;
+    return Math.max(1, Math.round(totals.total / sampledDayCount));
+  }, [sampledDayCount, stats, totals.total]);
+
+  const filteredTopChats = useMemo(() => {
+    const chats = stats?.topChats ?? [];
+    switch (chatFilterMode) {
+      case "direct":
+        return chats.filter((chat) => !chat.isGroup);
+      case "group":
+        return chats.filter((chat) => chat.isGroup);
+      default:
+        return chats;
+    }
+  }, [chatFilterMode, stats]);
+  const topChatPreview = filteredTopChats.slice(0, visibleChatCount);
+  const summaryCards = useMemo(
+    () => [
+      {
+        key: "total",
+        label: "All messages",
+        value: totals.total ? formatNumber(totals.total) : "—",
+      },
+      {
+        key: "sent",
+        label: "Sent",
+        value: totals.sent ? formatNumber(totals.sent) : "—",
+        footnote: totals.total ? formatPercent(totals.sent, totals.total) : undefined,
+      },
+      {
+        key: "received",
+        label: "Received",
+        value: totals.received ? formatNumber(totals.received) : "—",
+        footnote: totals.total ? formatPercent(totals.received, totals.total) : undefined,
+      },
+      {
+        key: "pace",
+        label: "Daily average",
+        value: averagePerDay ? formatNumber(averagePerDay) : "—",
+      },
+    ],
+    [averagePerDay, totals.received, totals.sent, totals.total],
+  );
+
+  const summaryCardStyles: Record<
+    string,
+    { wrapper: string; valueClass: string; badgeClass: string }
+  > = {
+    total: {
+      wrapper: "border-neutral-800/70 bg-neutral-950/50",
+      valueClass: "text-white",
+      badgeClass: "text-neutral-400",
+    },
+    sent: {
+      wrapper: "border-emerald-500/30 bg-emerald-500/5",
+      valueClass: "text-emerald-300",
+      badgeClass: "text-emerald-300",
+    },
+    received: {
+      wrapper: "border-sky-500/30 bg-sky-500/5",
+      valueClass: "text-sky-300",
+      badgeClass: "text-sky-300",
+    },
+    pace: {
+      wrapper: "border-amber-400/30 bg-amber-500/5",
+      valueClass: "text-amber-200",
+      badgeClass: "text-amber-200",
+    },
+  };
+  const handleStatsRefresh = () => setStatsRefreshToken((token) => token + 1);
 
   const hourlyMax = useMemo(() => {
     if (!stats || stats.hourlyCounts.length === 0) return 0;
@@ -168,9 +279,43 @@ export default function Dashboard() {
     }, 0);
   }, [stats]);
 
+  const isHourlyView = activityView === "hourly";
+  const activityCounts: Array<HourlyCount | WeekdayCount> = !stats
+    ? []
+    : isHourlyView
+      ? stats.hourlyCounts
+      : stats.weekdayCounts;
+  const activityMax = isHourlyView ? hourlyMax : weekdayMax;
+  const activityEmptyMessage = isHourlyView
+    ? "No hourly activity recorded."
+    : "No weekday activity recorded.";
+  const mostActiveChat = stats?.topChats.length ? stats.topChats[0] : null;
+  const latestActivitySource = stats?.latestMessageAt ?? mostActiveChat?.lastMessageAt ?? null;
+  const latestActivityLabel = stats ? formatDateTime(latestActivitySource) : "Waiting for data";
+  const shouldShowDailyAverage = !["1h", "6h", "12h", "1d"].includes(statsRange);
+  const topConversationsTitle =
+    chatFilterMode === "group" ? "Top Groups" : chatFilterMode === "direct" ? "Top Chats" : "Top Conversations";
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = window.localStorage.getItem(ACCESS_TIP_STORAGE_KEY);
+    setAccessTipDismissed(stored === "true");
+  }, []);
+
+  const handleDismissAccessTip = () => {
+    setAccessTipDismissed(true);
+    try {
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(ACCESS_TIP_STORAGE_KEY, "true");
+      }
+    } catch {
+      // Ignore storage errors (e.g., private mode)
+    }
+  };
+
   useEffect(() => {
     const controller = new AbortController();
-    const params = new URLSearchParams({ limit: "15" });
+    const params = new URLSearchParams({ limit: DEFAULT_STATS_LIMIT.toString() });
     const rangeDates = getRangeDates(statsRange);
     if (rangeDates.start) params.set("start", rangeDates.start);
     if (rangeDates.end) params.set("end", rangeDates.end);
@@ -184,13 +329,21 @@ export default function Dashboard() {
         });
         if (!response.ok) {
           const payload = await response.json().catch(() => ({}));
-          throw new Error(payload.error ?? `Request failed with ${response.status}`);
+          const error = new Error(payload.error ?? `Request failed with ${response.status}`) as Error & {
+            status?: number;
+          };
+          error.status = response.status;
+          throw error;
         }
         const json = (await response.json()) as { data: ConversationStats };
         setStats(json.data);
+        setAccessError(false);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
-        setStatsError(error instanceof Error ? error.message : "Unable to load stats.");
+        const errorMessage = error instanceof Error ? error.message : "Unable to load stats.";
+        setStatsError(errorMessage);
+        const status = error && typeof error === "object" ? (error as { status?: number }).status : undefined;
+        setAccessError(status === 403);
       } finally {
         setStatsLoading(false);
       }
@@ -198,412 +351,263 @@ export default function Dashboard() {
 
     fetchStats();
     return () => controller.abort();
-  }, [statsRange]);
+  }, [statsRange, statsRefreshToken]);
 
-  function buildSearchRequest(): SearchRequest {
-    return {
-      q: query.trim(),
-      chatId: chatId.trim() || undefined,
-      fromMe,
-      fromOthers,
-      start: startDate || undefined,
-      end: endDate || undefined,
-    };
-  }
-
-  function buildSearchParams(request: SearchRequest, offset: number) {
-    const params = new URLSearchParams({
-      q: request.q,
-      limit: PAGE_SIZE.toString(),
-      offset: offset.toString(),
-    });
-    if (request.chatId) params.set("chatId", request.chatId);
-    if (!request.fromMe) params.set("fromMe", "false");
-    if (!request.fromOthers) params.set("fromOthers", "false");
-    if (request.start) params.set("start", request.start);
-    if (request.end) params.set("end", request.end);
-    return params;
-  }
-
-  async function executeSearch(append = false) {
-    const request = append ? lastSearchRequest : buildSearchRequest();
-
-    if (!request) {
-      return;
-    }
-
-    if (!request.q) {
-      setSearchError("Enter a search query.");
-      if (!append) {
-        setSearchResults([]);
-      }
-      return;
-    }
-
-    if (!request.fromMe && !request.fromOthers) {
-      setSearchError("Enable at least one of the sender filters.");
-      return;
-    }
-
-    const offset = append ? searchResults.length : 0;
-    const params = buildSearchParams(request, offset);
-
-    if (!append) {
-      setSearchLoading(true);
-      setSearchError(null);
-      setSearchResults([]);
-      setHasMoreSearchResults(false);
-    } else {
-      setLoadMoreLoading(true);
-    }
-
-    try {
-      const response = await fetch(`/api/search?${params.toString()}`);
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.error ?? `Request failed with ${response.status}`);
-      }
-      const json = (await response.json()) as { data: SearchResult[] };
-
-      if (append) {
-        setSearchResults((prev) => [...prev, ...json.data]);
-      } else {
-        setSearchResults(json.data);
-      }
-
-      setHasMoreSearchResults(json.data.length === PAGE_SIZE);
-      if (!append) {
-        setLastSearchRequest(request);
-      }
-    } catch (error) {
-      setSearchError(error instanceof Error ? error.message : "Search failed unexpectedly.");
-      if (!append) {
-        setSearchResults([]);
-      }
-    } finally {
-      if (append) {
-        setLoadMoreLoading(false);
-      } else {
-        setSearchLoading(false);
-      }
-    }
-  }
-
-  function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void executeSearch(false);
-  }
-
-  function resetFilters() {
-    setChatId("");
-    setFromMe(true);
-    setFromOthers(true);
-    setStartDate("");
-    setEndDate("");
-  }
+  const shouldShowAccessTip = accessError && !accessTipDismissed;
 
   return (
     <div className="min-h-screen bg-neutral-950 pb-16 text-neutral-100">
-      <header className="border-b border-neutral-800 bg-neutral-900/80 py-6 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-3 px-6">
-          <h1 className="text-3xl font-semibold tracking-tight text-white">
-            iMessage Insights
-          </h1>
-          <p className="text-sm text-neutral-400">
-            Run read-only analytics against your local Messages database. Grant Terminal full disk
-            access if you encounter authorization errors.
-          </p>
+      <header className="relative overflow-hidden border-b border-neutral-800/70 bg-gradient-to-b from-neutral-950 via-neutral-950 to-black py-12">
+        <div className="pointer-events-none absolute inset-0">
+          <div className="absolute inset-0 bg-gradient-to-b from-emerald-500/10 via-transparent to-transparent" />
+          <div className="absolute inset-y-0 right-0 w-1/2 bg-gradient-to-l from-sky-500/20 via-transparent to-transparent blur-3xl opacity-60" />
+        </div>
+        <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-8 px-6">
+          <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+            <div className="space-y-5">
+              <div className="flex flex-wrap items-center gap-3 text-[0.7rem] font-semibold uppercase tracking-wide text-emerald-200">
+                <span className="rounded-full border border-emerald-400/40 bg-emerald-400/10 px-3 py-1">Beta</span>
+              </div>
+              <div>
+                <h1 className="text-4xl font-semibold tracking-tight text-white">Messages Analytics</h1>
+                <p className="mt-2 max-w-2xl text-base text-neutral-400">
+                  Run private analytics against your Messages database to uncover trends, busiest chats, and daily habits.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-sm text-neutral-400">
+                <div className="flex items-center gap-2 rounded-full border border-neutral-800/80 bg-neutral-900/80 px-3 py-1">
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
+                  <span>{stats ? `Latest activity ${latestActivityLabel}` : "Awaiting first sync…"}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleStatsRefresh}
+                  className="rounded-full border border-emerald-500/40 bg-emerald-500/10 p-2 text-emerald-200 transition hover:border-emerald-400/80 hover:bg-emerald-400/20 hover:text-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70"
+                >
+                  <span className="sr-only">Refresh stats</span>
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
+                    <path
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.7"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M4.5 12a7.5 7.5 0 0113.5-4.472M19.5 5.25v4.5m0-4.5h-4.5M19.5 12a7.5 7.5 0 01-13.5 4.472M4.5 18.75v-4.5m0 4.5h4.5"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </header>
 
       <main className="mx-auto mt-10 flex w-full max-w-6xl flex-col gap-10 px-6">
-        <section className="rounded-2xl border border-neutral-800 bg-neutral-900/50 p-6 shadow-lg shadow-black/30">
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <label className="flex w-full flex-col gap-2 text-sm text-neutral-300">
-                Search messages
-                <div className="flex items-center gap-3">
-                  <input
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    placeholder='Try "dinner", "NEAR(holiday, flight)" or a phone number'
-                    className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-base text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70"
-                  />
+        <section className="space-y-6">
+          <div className="space-y-4 rounded-2xl border border-neutral-800/70 bg-neutral-900/40 p-6 shadow-lg shadow-black/30">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-semibold text-white">Statistics</h2>
+              </div>
+              <div className="ml-auto flex flex-wrap items-center gap-2 text-xs text-neutral-400">
+                {statsRangeOptions.map((rangeOption) => (
                   <button
-                    type="submit"
-                    className="hidden rounded-lg bg-emerald-500 px-4 py-2 text-sm font-medium text-emerald-950 transition hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-300 disabled:cursor-not-allowed disabled:opacity-60 sm:block"
-                    disabled={searchLoading}
+                    key={rangeOption}
+                    type="button"
+                    onClick={() => setStatsRange(rangeOption)}
+                    aria-pressed={statsRange === rangeOption}
+                    className={`rounded-full border px-3 py-1 font-semibold transition ${
+                      statsRange === rangeOption
+                        ? "border-emerald-400/70 bg-emerald-400/90 text-emerald-950 shadow shadow-emerald-500/30"
+                        : "border-neutral-800/80 text-neutral-300 hover:border-neutral-600 hover:text-white"
+                    }`}
                   >
-                    {searchLoading ? "Searching..." : "Search"}
+                    {rangeOption === "all" ? "All Time" : rangeOption}
                   </button>
-                </div>
-              </label>
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              <label className="flex flex-col gap-2 text-sm text-neutral-300">
-                Chat ID
-                <input
-                  value={chatId}
-                  onChange={(event) => setChatId(event.target.value)}
-                  placeholder="Optional numeric chat identifier"
-                  className="rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70"
-                />
-              </label>
-
-              <label className="flex flex-col gap-2 text-sm text-neutral-300">
-                Start date
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={(event) => setStartDate(event.target.value)}
-                  className="rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-neutral-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/70"
-                />
-              </label>
-
-              <label className="flex flex-col gap-2 text-sm text-neutral-300">
-                End date
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={(event) => setEndDate(event.target.value)}
-                  className="rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-neutral-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/70"
-                />
-              </label>
-
-              <div className="flex items-end gap-3">
-                <label className="flex items-center gap-2 text-sm text-neutral-300">
-                  <input
-                    type="checkbox"
-                    checked={fromMe}
-                    onChange={(event) => setFromMe(event.target.checked)}
-                    className="h-4 w-4 rounded border-neutral-600 bg-neutral-950 text-emerald-500 focus:ring-emerald-400"
-                  />
-                  Sent by me
-                </label>
-                <label className="flex items-center gap-2 text-sm text-neutral-300">
-                  <input
-                    type="checkbox"
-                    checked={fromOthers}
-                    onChange={(event) => setFromOthers(event.target.checked)}
-                    className="h-4 w-4 rounded border-neutral-600 bg-neutral-950 text-emerald-500 focus:ring-emerald-400"
-                  />
-                  From others
-                </label>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                type="submit"
-                className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-medium text-emerald-950 transition hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-300 disabled:cursor-not-allowed disabled:opacity-60 sm:hidden"
-                disabled={searchLoading}
-              >
-                {searchLoading ? "Searching..." : "Search"}
-              </button>
-              <button
-                type="button"
-                onClick={resetFilters}
-                className="rounded-lg border border-neutral-700 px-4 py-2 text-sm font-medium text-neutral-200 transition hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-neutral-500/50"
-              >
-                Reset filters
-              </button>
-              <p className="flex-1 text-sm text-neutral-500">
-                Supports iMessage full-text search syntax, including boolean operators and NEAR
-                queries.
-              </p>
-            </div>
-            {searchError && <p className="text-sm text-red-400">{searchError}</p>}
-          </form>
-
-          <div className="mt-6 space-y-3">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-white">Search results</h2>
-              <span className="text-xs text-neutral-500">
-                Showing {searchResults.length} messages
-              </span>
-            </div>
-            <div className="divide-y divide-neutral-800 rounded-xl border border-neutral-800 bg-neutral-950/70">
-              {searchResults.length === 0 && !searchLoading ? (
-                <div className="p-6 text-sm text-neutral-500">
-                  Results will appear here after you run a search.
-                </div>
-              ) : (
-                searchResults.map((message) => (
-                  <article key={message.messageId} className="flex flex-col gap-2 p-4">
-                    <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-wide text-neutral-500">
-                      <span className="font-semibold text-emerald-400">
-                        {message.isFromMe ? "Me" : "Contact"}
-                      </span>
-                      <span className="text-neutral-700">•</span>
-                      <span>{formatParticipants(message)}</span>
-                      <span className="text-neutral-700">•</span>
-                      <span>{formatDateTime(message.sentAt)}</span>
-                      <span className="text-neutral-700">•</span>
-                      <span>Chat #{message.chatId}</span>
-                    </div>
-                    <p className="text-sm leading-6 text-neutral-100">
-                      {highlightText(message.text, query)}
-                    </p>
-                  </article>
-                ))
-              )}
-              {searchLoading && (
-                <div className="p-4 text-sm text-neutral-500">Loading results…</div>
-              )}
-            </div>
-            {hasMoreSearchResults && (
-              <div className="mt-3 flex items-center justify-center">
-                <button
-                  type="button"
-                  onClick={() => void executeSearch(true)}
-                  disabled={loadMoreLoading}
-                  className="rounded-lg border border-neutral-700 px-4 py-2 text-sm font-medium text-neutral-200 transition hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-neutral-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {loadMoreLoading ? "Loading more…" : "Load more results"}
-                </button>
-              </div>
-            )}
-            {!searchLoading && searchResults.length > 0 && !hasMoreSearchResults && (
-              <p className="mt-3 text-center text-xs text-neutral-500">
-                Showing all matching messages ({searchResults.length}).
-              </p>
-            )}
-          </div>
-        </section>
-
-        <section className="grid gap-6 lg:grid-cols-[2fr,1fr]">
-          <div className="space-y-4 rounded-2xl border border-neutral-800 bg-neutral-900/50 p-6 shadow-lg shadow-black/30">
-            <div className="flex flex-wrap items-center gap-3">
-              <h2 className="text-lg font-semibold text-white">Conversation stats</h2>
-              <div className="flex gap-2 text-xs text-neutral-400">
-                <button
-                  type="button"
-                  onClick={() => setStatsRange("30d")}
-                  className={`rounded-full px-3 py-1 transition ${
-                    statsRange === "30d"
-                      ? "bg-emerald-500 text-emerald-950"
-                      : "border border-transparent hover:border-neutral-700"
-                  }`}
-                >
-                  30d
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStatsRange("90d")}
-                  className={`rounded-full px-3 py-1 transition ${
-                    statsRange === "90d"
-                      ? "bg-emerald-500 text-emerald-950"
-                      : "border border-transparent hover:border-neutral-700"
-                  }`}
-                >
-                  90d
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStatsRange("all")}
-                  className={`rounded-full px-3 py-1 transition ${
-                    statsRange === "all"
-                      ? "bg-emerald-500 text-emerald-950"
-                      : "border border-transparent hover:border-neutral-700"
-                  }`}
-                >
-                  All time
-                </button>
+                ))}
               </div>
             </div>
             {statsError && <p className="text-sm text-red-400">{statsError}</p>}
-            {statsLoading && <p className="text-sm text-neutral-500">Loading stats…</p>}
+            {statsLoading && (
+              <div className="flex items-center gap-2 text-sm text-neutral-400">
+                <Spinner /> Refreshing stats…
+              </div>
+            )}
+            {!stats && !statsLoading && !statsError && (
+              <p className="text-sm text-neutral-500">
+                Choose a range to load your messaging insights.
+              </p>
+            )}
 
             {stats && (
-              <div className="space-y-6">
-                <div className="grid gap-4 sm:grid-cols-3">
-                  <div className="rounded-xl border border-neutral-800 bg-neutral-950/60 p-4">
-                    <p className="text-xs uppercase tracking-wide text-neutral-500">Total</p>
-                    <p className="mt-2 text-2xl font-semibold text-white">
-                      {formatNumber(totals.total)}
-                    </p>
-                  </div>
-                  <div className="rounded-xl border border-neutral-800 bg-neutral-950/60 p-4">
-                    <p className="text-xs uppercase tracking-wide text-neutral-500">Sent</p>
-                    <p className="mt-2 text-2xl font-semibold text-emerald-400">
-                      {formatNumber(totals.sent)}
-                    </p>
-                  </div>
-                  <div className="rounded-xl border border-neutral-800 bg-neutral-950/60 p-4">
-                    <p className="text-xs uppercase tracking-wide text-neutral-500">Received</p>
-                    <p className="mt-2 text-2xl font-semibold text-sky-400">
-                      {formatNumber(totals.received)}
-                    </p>
-                  </div>
+              <div
+                className={`space-y-5 transition-opacity duration-300 ${
+                  statsLoading ? "opacity-60" : "opacity-100"
+                }`}
+              >
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  {summaryCards.map((card) => (
+                    <div
+                      key={card.key}
+                      className={`rounded-xl border p-4 shadow shadow-black/10 ${
+                        (summaryCardStyles[card.key] ?? summaryCardStyles.total).wrapper
+                      }`}
+                    >
+                      <p className="text-xs uppercase tracking-wide text-neutral-400">{card.label}</p>
+                      <p
+                        className={`mt-2 text-2xl font-semibold ${
+                          (summaryCardStyles[card.key] ?? summaryCardStyles.total).valueClass
+                        }`}
+                      >
+                        {card.value}
+                        {card.footnote && (
+                          <span
+                            className={`ml-2 text-sm font-semibold ${
+                              (summaryCardStyles[card.key] ?? summaryCardStyles.total).badgeClass
+                            }`}
+                          >
+                            {card.footnote}
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                  ))}
                 </div>
 
-                <div>
-                  <h3 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">
-                    Top chats
-                  </h3>
-                  <div className="mt-2 divide-y divide-neutral-800 overflow-hidden rounded-xl border border-neutral-800">
-                    {stats.topChats.map((chat) => {
-                      const totalMessages = chat.messageCount;
-                      const ratio = totals.total ? totalMessages / totals.total : 0;
-                      return (
-                        <div
-                          key={chat.chatId}
-                          className="relative flex items-center justify-between gap-4 bg-neutral-950/60 px-4 py-3"
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/50 p-4">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <h3 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">
+                        {topConversationsTitle}
+                      </h3>
+                      <div className="ml-auto flex flex-wrap items-center gap-2">
+                        {chatFilterOptions.map((option) => (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => setChatFilterMode(option.value)}
+                            aria-pressed={chatFilterMode === option.value}
+                            className={`rounded-full border px-3 py-1 text-[11px] font-semibold transition ${
+                              chatFilterMode === option.value
+                                ? "border-emerald-400/80 bg-emerald-500/10 text-emerald-200"
+                                : "border-neutral-800/80 text-neutral-400 hover:text-white"
+                            }`}
+                          >
+                            {option.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-neutral-400">
+                      <label className="flex items-center gap-2">
+                        Show
+                        <select
+                          value={visibleChatCount}
+                          onChange={(event) => setVisibleChatCount(Number(event.target.value))}
+                          className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs text-neutral-200 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
                         >
-                          <div>
-                            <p className="text-sm font-medium text-neutral-100">
-                              {chat.chatDisplayName ?? formatParticipants(chat)}
-                            </p>
-                            <p className="text-xs text-neutral-500">
-                              {chat.isGroup ? "Group" : "1:1"} • Chat #{chat.chatId} • Last{" "}
-                              {formatDateTime(chat.lastMessageAt)}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-3 text-sm text-neutral-400">
-                            <span className="font-semibold text-neutral-100">
-                              {formatNumber(totalMessages)}
-                            </span>
-                            <span className="text-xs text-emerald-300">
-                              ↑ {formatNumber(chat.sentCount)}
-                            </span>
-                            <span className="text-xs text-sky-300">
-                              ↓ {formatNumber(chat.receivedCount)}
-                            </span>
-                          </div>
-                          <div
-                            className="absolute inset-y-0 left-0 w-full bg-emerald-500/10"
-                            style={{ transform: `scaleX(${ratio.toFixed(2)})`, transformOrigin: "left" }}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="grid gap-6 lg:grid-cols-2">
-                  <div>
-                    <h3 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">
-                      Hourly cadence
-                    </h3>
-                    <div className="mt-2 space-y-2 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4">
-                      {stats.hourlyCounts.length === 0 && (
-                        <p className="text-sm text-neutral-500">No hourly activity recorded.</p>
+                          {CHAT_COUNT_OPTIONS.map((option) => (
+                            <option key={option} value={option}>
+                              Top {option}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="mt-3 space-y-3">
+                      {topChatPreview.length === 0 ? (
+                        <p className="text-sm text-neutral-500">
+                          {filteredTopChats.length === 0
+                            ? "No conversations match this filter."
+                            : "No conversations in this range yet."}
+                        </p>
+                      ) : (
+                        topChatPreview.map((chat, index) => {
+                          const totalMessages = chat.messageCount;
+                          const percentShare = formatPercent(totalMessages, totals.total);
+                          const Icon = chat.isGroup ? GroupChatIcon : DirectChatIcon;
+                          const iconColor = chat.isGroup ? "text-rose-300" : "text-indigo-300";
+                          const isTopEntry = index === 0;
+                          const cardClasses = isTopEntry
+                            ? "border-emerald-500/60 bg-gradient-to-r from-emerald-500/15 via-neutral-950/70 to-neutral-950/40 shadow shadow-emerald-500/20"
+                            : "border-neutral-800 bg-neutral-950/70";
+                          return (
+                            <div
+                              key={chat.chatId}
+                              className={`rounded-lg border p-4 ${cardClasses}`}
+                            >
+                              <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-wide text-neutral-500">
+                                <Icon className={`h-3.5 w-3.5 ${iconColor}`} />
+                                <span>{chat.isGroup ? "Group" : "Chat"}</span>
+                                <span className="text-neutral-700">•</span>
+                                <span>{formatDateTime(chat.lastMessageAt)}</span>
+                              </div>
+                              <div className="mt-2 flex items-center justify-between gap-3">
+                                <p className="text-sm font-medium text-neutral-100">
+                                  {chat.chatDisplayName ?? formatParticipants(chat)}
+                                </p>
+                                <span className="text-xs text-neutral-400">{percentShare}</span>
+                              </div>
+                              <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-neutral-400">
+                                <span className="font-semibold text-neutral-100">
+                                  {formatNumber(totalMessages)} messages
+                                </span>
+                                <span className="text-emerald-300">↑ {formatNumber(chat.sentCount)}</span>
+                                <span className="text-sky-300">↓ {formatNumber(chat.receivedCount)}</span>
+                              </div>
+                            </div>
+                          );
+                        })
                       )}
-                      {stats.hourlyCounts.map((bucket) => {
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/50 p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">
+                        {isHourlyView ? "Hourly cadence" : "Weekday cadence"}
+                      </h3>
+                      <div className="ml-auto flex flex-wrap items-center gap-2">
+                        {(["hourly", "weekday"] as const).map((view) => (
+                          <button
+                            key={view}
+                            type="button"
+                            onClick={() => setActivityView(view)}
+                            aria-pressed={activityView === view}
+                            className={`rounded-full border px-3 py-1 text-[11px] font-semibold transition ${
+                              activityView === view
+                                ? "border-sky-400/80 bg-sky-500/10 text-sky-200"
+                                : "border-neutral-800/80 text-neutral-400 hover:text-white"
+                            }`}
+                          >
+                            {view === "hourly" ? "Hourly" : "Weekday"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="mt-2 space-y-2">
+                      {activityCounts.length === 0 && (
+                        <p className="text-sm text-neutral-500">{activityEmptyMessage}</p>
+                      )}
+                      {activityCounts.map((bucket, index) => {
                         const total = bucket.sentCount + bucket.receivedCount;
-                        const width = hourlyMax
-                          ? Math.min(100, Math.max(2, (total / hourlyMax) * 100))
+                        const width = activityMax
+                          ? Math.min(100, Math.max(2, (total / activityMax) * 100))
                           : 0;
+                        const label =
+                          "hour" in bucket
+                            ? `${bucket.hour.toString().padStart(2, "0")}h`
+                            : weekdayLabels[bucket.weekday];
                         return (
-                          <div key={bucket.hour} className="flex items-center gap-3 text-sm">
-                            <span className="w-10 text-xs text-neutral-500">
-                              {bucket.hour.toString().padStart(2, "0")}h
-                            </span>
+                          <div key={`${activityView}-${index}`} className="flex items-center gap-3 text-sm">
+                            <span className="w-10 text-xs text-neutral-500">{label}</span>
                             <div className="h-2 flex-1 rounded bg-neutral-800">
                               <div
                                 className="h-2 rounded bg-gradient-to-r from-emerald-400 to-sky-400"
-                                style={{ width: `${width}%` }}
+                                style={{
+                                  width: `${width}%`,
+                                  transition: "width 500ms cubic-bezier(0.32, 0.72, 0, 1)",
+                                }}
                               />
                             </div>
                             <span className="w-12 text-right text-xs text-neutral-400">
@@ -613,82 +617,75 @@ export default function Dashboard() {
                         );
                       })}
                     </div>
-                  </div>
-
-                  <div>
-                    <h3 className="text-sm font-semibold uppercase tracking-wide text-neutral-400">
-                      Weekday cadence
-                    </h3>
-                    <div className="mt-2 space-y-2 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4">
-                      {stats.weekdayCounts.length === 0 && (
-                        <p className="text-sm text-neutral-500">No weekday activity recorded.</p>
-                      )}
-                      {stats.weekdayCounts.map((bucket) => {
-                        const total = bucket.sentCount + bucket.receivedCount;
-                        const width = weekdayMax
-                          ? Math.min(100, Math.max(2, (total / weekdayMax) * 100))
-                          : 0;
-                        return (
-                          <div key={bucket.weekday} className="flex items-center gap-3 text-sm">
-                            <span className="w-10 text-xs text-neutral-500">
-                              {weekdayLabels[bucket.weekday]}
-                            </span>
-                            <div className="h-2 flex-1 rounded bg-neutral-800">
-                              <div
-                                className="h-2 rounded bg-gradient-to-r from-emerald-400 to-sky-400"
-                                style={{ width: `${width}%` }}
-                              />
-                            </div>
-                            <span className="w-12 text-right text-xs text-neutral-400">
-                              {formatNumber(total)}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
+                    <p className="mt-3 text-xs text-neutral-500">All times are shown in your system's time zone.</p>
                   </div>
                 </div>
               </div>
             )}
           </div>
-
-          <aside className="space-y-4 rounded-2xl border border-neutral-800 bg-neutral-900/50 p-6 shadow-lg shadow-black/30">
-            <h2 className="text-lg font-semibold text-white">Top contacts</h2>
-            {stats?.participantBreakdown && stats.participantBreakdown.length > 0 ? (
-              <ul className="space-y-3">
-                {stats.participantBreakdown.map((participant) => (
-                  <li
-                    key={participant.id ?? "me"}
-                    className="rounded-xl border border-neutral-800 bg-neutral-950/60 p-4"
-                  >
-                    <p className="text-sm font-medium text-neutral-100">
-                      {participant.displayName ?? participant.id ?? "Me"}
-                    </p>
-                    <p className="text-xs text-neutral-500">
-                      {formatNumber(participant.sentCount)} sent • {formatNumber(participant.receivedCount)} received
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            ) : statsLoading ? (
-              <p className="text-sm text-neutral-500">Loading contacts…</p>
-            ) : statsError ? (
-              <p className="text-sm text-red-400">{statsError}</p>
-            ) : (
-              <p className="text-sm text-neutral-500">No contacts found in the selected range.</p>
-            )}
-
-            <div className="rounded-xl border border-dashed border-neutral-800 bg-neutral-950/40 p-4 text-xs text-neutral-500">
-              <p className="font-semibold text-neutral-300">Ideas to explore</p>
-              <ul className="mt-2 list-disc space-y-1 pl-4 text-neutral-400">
-                <li>Search by phone number or email to inspect a single thread.</li>
-                <li>Use NEAR queries to surface conversations around a trip or event.</li>
-                <li>Filter by date range to understand messaging cadence over time.</li>
-              </ul>
-            </div>
-          </aside>
         </section>
       </main>
+
+      {shouldShowAccessTip && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="access-tip-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-10 backdrop-blur"
+        >
+          <div className="relative w-full max-w-md rounded-2xl border border-sky-500/40 bg-neutral-950/95 p-5 text-sky-50 shadow-2xl shadow-black/60">
+            <button
+              type="button"
+              onClick={handleDismissAccessTip}
+              className="absolute right-4 top-4 rounded-full border border-sky-300/40 p-1 text-sky-200 transition hover:border-sky-200 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/70"
+              aria-label="Dismiss Full Disk Access dialog"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M6.225 4.811a1 1 0 0 0-1.414 1.414L10.586 12l-5.775 5.775a1 1 0 0 0 1.414 1.414L12 13.414l5.775 5.775a1 1 0 0 0 1.414-1.414L13.414 12l5.775-5.775a1 1 0 0 0-1.414-1.414L12 10.586 6.225 4.811Z"
+                />
+              </svg>
+            </button>
+            <div className="flex items-start gap-3 pr-6">
+              <div className="flex h-12 min-w-[3rem] items-center justify-center rounded-xl bg-sky-500/20 px-3 text-sky-50">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="h-6 w-6" aria-hidden="true">
+                  <path fill="currentColor" d="M11 10h2v7h-2zm0-4h2v2h-2z" />
+                  <path
+                    fill="currentColor"
+                    d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2m0 18c-4.411 0-8-3.589-8-8s3.589-8 8-8 8 3.589 8 8-3.589 8-8 8"
+                  />
+                </svg>
+              </div>
+              <div>
+                <h2 id="access-tip-title" className="text-lg font-semibold text-white">
+                  Grant Full Disk Access
+                </h2>
+                <p className="mt-2 text-sm text-sky-100/80">
+                  macOS denied access to the Messages database. Open System Settings → Privacy & Security → Full Disk Access and enable Terminal (or the host app), then refresh.
+                </p>
+                <p className="mt-3 text-xs text-sky-100/70">Analysis always stays on-device—no data leaves your Mac.</p>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={handleStatsRefresh}
+                    className="rounded-full border border-sky-400/60 bg-sky-500/20 px-4 py-1.5 text-sm font-semibold text-sky-50 transition hover:border-sky-300 hover:bg-sky-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/70"
+                  >
+                    Retry now
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDismissAccessTip}
+                    className="rounded-full border border-sky-300/30 px-4 py-1.5 text-sm font-semibold text-sky-200 transition hover:border-sky-200 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3";
+import { getContactInfoForHandle, getContactNameForHandle, normalizeHandleIdentifier } from "../contacts";
 import { getDatabase } from "./db";
 import { fromAppleTimestamp, toAppleTimestamp } from "./dates";
 import type {
@@ -14,6 +15,7 @@ import type {
 
 let cachedFtsSupport: boolean | null = null;
 let cachedHandleDisplayName: boolean | null = null;
+let cachedMessageDeletionFlag: boolean | null = null;
 
 function detectFtsSupport(db: BetterSqliteDatabase): boolean {
   if (cachedFtsSupport !== null) {
@@ -50,6 +52,23 @@ function detectHandleDisplayName(db: BetterSqliteDatabase): boolean {
   return cachedHandleDisplayName;
 }
 
+function detectMessageDeletionColumn(db: BetterSqliteDatabase): boolean {
+  if (cachedMessageDeletionFlag !== null) {
+    return cachedMessageDeletionFlag;
+  }
+
+  try {
+    const stmt: Statement = db.prepare("PRAGMA table_info(message)");
+    const rows = stmt.all() as { name: string }[];
+    cachedMessageDeletionFlag = rows.some((row) => row.name === "is_deleted");
+  } catch (error) {
+    console.warn("Unable to inspect message table columns:", error);
+    cachedMessageDeletionFlag = false;
+  }
+
+  return cachedMessageDeletionFlag;
+}
+
 function buildFtsQuery(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) return "";
@@ -77,10 +96,42 @@ function collectParticipants(participantsCsv: string | null): string[] {
     return [];
   }
 
-  return participantsCsv
+  const rawValues = participantsCsv
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+
+  const names: string[] = [];
+  const seen = new Set<string>();
+
+  for (const value of rawValues) {
+    const contactInfo = getContactInfoForHandle(value);
+    const fallbackName = getContactNameForHandle(value) ?? value;
+    const normalizedHandle = normalizeHandleIdentifier(value) ?? value;
+    const key =
+      contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+        ? `contact:${contactInfo.recordId}`
+        : `handle:${normalizedHandle}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    const name = contactInfo?.name ?? fallbackName;
+    if (name.toLowerCase() === "me") {
+      seen.add(key);
+      continue;
+    }
+
+    seen.add(key);
+    names.push(name);
+  }
+
+  if (names.length === 0) {
+    return rawValues;
+  }
+
+  return names;
 }
 
 export function searchMessages(options: SearchOptions): SearchResultMessage[] {
@@ -101,6 +152,7 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
   }
 
   const ftsSupported = detectFtsSupport(db);
+  const hasDeletionFlag = detectMessageDeletionColumn(db);
   const ftsQuery = buildFtsQuery(query);
 
   const params: Record<string, unknown> = {
@@ -109,6 +161,9 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
   };
 
   const whereClauses: string[] = [];
+  if (hasDeletionFlag) {
+    whereClauses.push("m.is_deleted = 0");
+  }
 
   if (ftsSupported && ftsQuery) {
     whereClauses.push("fts MATCH @ftsQuery");
@@ -176,15 +231,21 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
       sentDate: number | null;
     }[];
 
-    return rows.map((row) => ({
-      messageId: row.messageId,
-      chatId: row.chatId,
-      chatDisplayName: row.chatDisplayName,
-      participants: collectParticipants(row.participants),
-      text: row.text,
-      isFromMe: row.isFromMe === 1,
-      sentAt: fromAppleTimestamp(row.sentDate),
-    }));
+    return rows.map((row) => {
+      const participantNames = collectParticipants(row.participants);
+      const derivedName =
+        row.chatDisplayName ?? (participantNames.length === 1 ? participantNames[0] : null);
+
+      return {
+        messageId: row.messageId,
+        chatId: row.chatId,
+        chatDisplayName: derivedName,
+        participants: participantNames,
+        text: row.text,
+        isFromMe: row.isFromMe === 1,
+        sentAt: fromAppleTimestamp(row.sentDate),
+      };
+    });
   } catch (error) {
     // Fall back to LIKE if FTS query failed (e.g., the virtual table is corrupt).
     if (ftsSupported) {
@@ -202,9 +263,9 @@ export interface StatsOptions {
 
 const DAY_BUCKET_EXPR = `
 CASE
-  WHEN ABS(m.date) > 1000000000000 THEN date(m.date / 1000000000 + 978307200, 'unixepoch')
-  WHEN ABS(m.date) > 1000000000 THEN date(m.date / 1000000 + 978307200, 'unixepoch')
-  ELSE date(m.date + 978307200, 'unixepoch')
+  WHEN ABS(m.date) > 1000000000000 THEN date(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime')
+  WHEN ABS(m.date) > 1000000000 THEN date(m.date / 1000000 + 978307200, 'unixepoch', 'localtime')
+  ELSE date(m.date + 978307200, 'unixepoch', 'localtime')
 END
 `;
 
@@ -212,11 +273,17 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const db = getDatabase();
   const { limit = 15, dateRange } = options;
   const hasDisplayName = detectHandleDisplayName(db);
+  const hasDeletionFlag = detectMessageDeletionColumn(db);
+  const participantLimit = Math.max(limit * 3, limit);
 
   const params: Record<string, unknown> = {
     limit,
+    participantLimit,
   };
   const messageWhere: string[] = [];
+  if (hasDeletionFlag) {
+    messageWhere.push("m.is_deleted = 0");
+  }
 
   if (dateRange?.start) {
     params.start = toAppleTimestamp(dateRange.start);
@@ -231,30 +298,66 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const messageWhereSql = messageWhere.length ? `WHERE ${messageWhere.join(" AND ")}` : "";
 
   const topChatsSql = `
+    WITH message_stats AS (
+      SELECT
+        c.ROWID AS chatId,
+        c.display_name AS chatDisplayName,
+        COUNT(m.ROWID) AS messageCount,
+        SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
+        SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount,
+        MAX(m.date) AS lastMessageDate
+      FROM chat c
+      JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+      JOIN message m ON m.ROWID = cmj.message_id
+      ${messageWhereSql}
+      GROUP BY c.ROWID
+    ),
+    participants AS (
+      SELECT
+        combined.chatId,
+        COUNT(DISTINCT combined.handleRowId) AS participantCount,
+        GROUP_CONCAT(DISTINCT combined.handleId) AS participants
+      FROM (
+        SELECT
+          chj.chat_id AS chatId,
+          h.ROWID AS handleRowId,
+          h.id AS handleId
+        FROM chat_handle_join chj
+        LEFT JOIN handle h ON h.ROWID = chj.handle_id
+        UNION ALL
+        SELECT
+          cmj.chat_id AS chatId,
+          h.ROWID AS handleRowId,
+          h.id AS handleId
+        FROM chat_message_join cmj
+        JOIN message m ON m.ROWID = cmj.message_id
+        LEFT JOIN handle h ON h.ROWID = m.handle_id
+        ${messageWhereSql}
+      ) combined
+      WHERE combined.handleId IS NOT NULL
+      GROUP BY combined.chatId
+    )
     SELECT
-      c.ROWID AS chatId,
-      c.display_name AS chatDisplayName,
-      COUNT(DISTINCT h.ROWID) AS participantCount,
-      GROUP_CONCAT(DISTINCT h.id) AS participants,
-      COUNT(m.ROWID) AS messageCount,
-      SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
-      SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount,
-      MAX(m.date) AS lastMessageDate
-    FROM chat c
-    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
-    JOIN message m ON m.ROWID = cmj.message_id
-    LEFT JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
-    LEFT JOIN handle h ON h.ROWID = chj.handle_id
-    ${messageWhereSql}
-    GROUP BY c.ROWID
-    ORDER BY messageCount DESC
+      ms.chatId,
+      ms.chatDisplayName,
+      COALESCE(p.participantCount, 0) AS participantCount,
+      p.participants,
+      ms.messageCount,
+      ms.sentCount,
+      ms.receivedCount,
+      ms.lastMessageDate
+    FROM message_stats ms
+    LEFT JOIN participants p ON p.chatId = ms.chatId
+    ORDER BY ms.messageCount DESC
     LIMIT @limit
   `;
+
+  const participantDisplayColumn = hasDisplayName ? "h.display_name" : "NULL";
 
   const participantSql = `
     SELECT
       h.id AS handleId,
-      COALESCE(${hasDisplayName ? "h.display_name" : "NULL"}, h.id) AS displayName,
+      ${participantDisplayColumn} AS handleDisplayName,
       COUNT(m.ROWID) AS messageCount,
       SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
       SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
@@ -264,7 +367,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     GROUP BY h.id
     HAVING messageCount > 0
     ORDER BY messageCount DESC
-    LIMIT @limit
+    LIMIT @participantLimit
   `;
 
   const dailySql = `
@@ -282,9 +385,9 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const hourlySql = `
     SELECT
       CASE
-        WHEN ABS(m.date) > 1000000000000 THEN strftime('%H', datetime(m.date / 1000000000 + 978307200, 'unixepoch'))
-        WHEN ABS(m.date) > 1000000000 THEN strftime('%H', datetime(m.date / 1000000 + 978307200, 'unixepoch'))
-        ELSE strftime('%H', datetime(m.date + 978307200, 'unixepoch'))
+        WHEN ABS(m.date) > 1000000000000 THEN strftime('%H', datetime(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime'))
+        WHEN ABS(m.date) > 1000000000 THEN strftime('%H', datetime(m.date / 1000000 + 978307200, 'unixepoch', 'localtime'))
+        ELSE strftime('%H', datetime(m.date + 978307200, 'unixepoch', 'localtime'))
       END AS hourBucket,
       SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
       SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
@@ -298,9 +401,9 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const weekdaySql = `
     SELECT
       CASE
-        WHEN ABS(m.date) > 1000000000000 THEN strftime('%w', datetime(m.date / 1000000000 + 978307200, 'unixepoch'))
-        WHEN ABS(m.date) > 1000000000 THEN strftime('%w', datetime(m.date / 1000000 + 978307200, 'unixepoch'))
-        ELSE strftime('%w', datetime(m.date + 978307200, 'unixepoch'))
+        WHEN ABS(m.date) > 1000000000000 THEN strftime('%w', datetime(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime'))
+        WHEN ABS(m.date) > 1000000000 THEN strftime('%w', datetime(m.date / 1000000 + 978307200, 'unixepoch', 'localtime'))
+        ELSE strftime('%w', datetime(m.date + 978307200, 'unixepoch', 'localtime'))
       END AS weekdayBucket,
       SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
       SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount
@@ -311,11 +414,22 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     ORDER BY weekdayBucket
   `;
 
+  const totalsSql = `
+    SELECT
+      COUNT(m.ROWID) AS messageCount,
+      SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
+      SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount,
+      MAX(m.date) AS latestMessageDate
+    FROM message m
+    ${messageWhereSql}
+  `;
+
   const topChatsStmt = db.prepare(topChatsSql);
   const participantStmt = db.prepare(participantSql);
   const dailyStmt = db.prepare(dailySql);
   const hourlyStmt = db.prepare(hourlySql);
   const weekdayStmt = db.prepare(weekdaySql);
+  const totalsStmt = db.prepare(totalsSql);
 
   const topChatsRows = topChatsStmt.all(params) as {
     chatId: number;
@@ -330,7 +444,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
 
   const participantsRows = participantStmt.all(params) as {
     handleId: string | null;
-    displayName: string | null;
+    handleDisplayName: string | null;
     messageCount: number;
     sentCount: number;
     receivedCount: number;
@@ -354,24 +468,86 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     receivedCount: number;
   }[];
 
-  const topChats: ChatSummary[] = topChatsRows.map((row) => ({
-    chatId: row.chatId,
-    chatDisplayName: row.chatDisplayName,
-    isGroup: row.participantCount > 1,
-    participants: collectParticipants(row.participants),
-    messageCount: row.messageCount,
-    sentCount: row.sentCount,
-    receivedCount: row.receivedCount,
-    lastMessageAt: fromAppleTimestamp(row.lastMessageDate),
-  }));
+  const totalsRow = totalsStmt.get(params) as {
+    messageCount: number | null;
+    sentCount: number | null;
+    receivedCount: number | null;
+    latestMessageDate: number | null;
+  } | undefined;
 
-  const participantBreakdown: ChatParticipantStats[] = participantsRows.map((row) => ({
-    id: row.handleId,
-    displayName: row.displayName,
-    messageCount: row.messageCount,
-    sentCount: row.sentCount,
-    receivedCount: row.receivedCount,
-  }));
+  const totals = {
+    messageCount: totalsRow?.messageCount ?? 0,
+    sentCount: totalsRow?.sentCount ?? 0,
+    receivedCount: totalsRow?.receivedCount ?? 0,
+  };
+  const latestMessageAt = fromAppleTimestamp(totalsRow?.latestMessageDate ?? null);
+
+  const topChats: ChatSummary[] = topChatsRows.map((row) => {
+    const participantNames = collectParticipants(row.participants);
+    const derivedName =
+      participantNames.length === 1
+        ? participantNames[0]
+        : row.chatDisplayName ?? (participantNames.length > 0 ? participantNames.join(", ") : null);
+    const isGroup =
+      participantNames.length > 0 ? participantNames.length > 1 : row.participantCount > 1;
+
+    return {
+      chatId: row.chatId,
+      chatDisplayName: derivedName,
+      isGroup,
+      participants: participantNames,
+      messageCount: row.messageCount,
+      sentCount: row.sentCount,
+      receivedCount: row.receivedCount,
+      lastMessageAt: fromAppleTimestamp(row.lastMessageDate),
+    };
+  });
+
+  const participantAggregate = new Map<string, ChatParticipantStats>();
+  for (const row of participantsRows) {
+    if (!row.handleId) {
+      continue;
+    }
+
+    const normalizedHandle = normalizeHandleIdentifier(row.handleId);
+    const contactInfo = getContactInfoForHandle(row.handleId);
+    const preferredName =
+      contactInfo?.name ??
+      (row.handleDisplayName && row.handleDisplayName !== row.handleId ? row.handleDisplayName : null) ??
+      row.handleId;
+    const aggregateKey =
+      contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+        ? `contact:${contactInfo.recordId}`
+        : normalizedHandle
+          ? `handle:${normalizedHandle}`
+          : `raw:${row.handleId}`;
+
+    const existing = participantAggregate.get(aggregateKey);
+    if (existing) {
+      existing.messageCount += row.messageCount;
+      existing.sentCount += row.sentCount;
+      existing.receivedCount += row.receivedCount;
+      if (!existing.displayName && preferredName) {
+        existing.displayName = preferredName;
+      }
+      continue;
+    }
+
+    participantAggregate.set(aggregateKey, {
+      id:
+        contactInfo?.recordId !== null && contactInfo?.recordId !== undefined
+          ? `contact-${contactInfo.recordId}`
+          : normalizedHandle ?? row.handleId,
+      displayName: preferredName,
+      messageCount: row.messageCount,
+      sentCount: row.sentCount,
+      receivedCount: row.receivedCount,
+    });
+  }
+
+  const participantBreakdown: ChatParticipantStats[] = Array.from(participantAggregate.values())
+    .sort((a, b) => b.messageCount - a.messageCount)
+    .slice(0, limit);
 
   const dailyCounts: DailyCount[] = dailyRows.map((row) => ({
     date: new Date(`${row.day}T00:00:00`),
@@ -397,5 +573,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     dailyCounts,
     hourlyCounts,
     weekdayCounts,
+    totals,
+    latestMessageAt,
   };
 }
