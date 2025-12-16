@@ -17,13 +17,13 @@ export function fromAppleTimestamp(value: AppleTimestamp): Date | null {
 
   const absValue = Math.abs(value);
 
-  // macOS Big Sur+ uses nanoseconds, older macOS uses seconds.
+  // macOS Big Sur+ uses nanoseconds, older macOS uses seconds. Some stores use microseconds.
   const seconds =
-    absValue > 1e12
+    absValue > 1e15
       ? value / 1_000_000_000 // nanoseconds
-      : absValue > 1e9
-      ? value / 1_000_000 // microseconds
-      : value; // seconds
+      : absValue > 1e12
+        ? value / 1_000_000 // microseconds
+        : value; // seconds
 
   const unixSeconds = seconds + APPLE_EPOCH_OFFSET;
   return new Date(unixSeconds * 1000);
@@ -40,4 +40,3 @@ export function isWithinRange(date: Date, start?: Date, end?: Date): boolean {
   if (end && date > end) return false;
   return true;
 }
-

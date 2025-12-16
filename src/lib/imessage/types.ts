@@ -6,7 +6,9 @@ export interface DateRange {
 }
 
 export interface SearchOptions {
-  query: string;
+  query?: string;
+  mode?: MessageSearchMode;
+  sender?: string;
   chatId?: number;
   limit?: number;
   offset?: number;
@@ -15,11 +17,16 @@ export interface SearchOptions {
   dateRange?: DateRange;
 }
 
+export type MessageSearchMode = "smart" | "fuzzy" | "phrase" | "contains" | "exact";
+
 export interface SearchResultMessage {
   messageId: number;
   chatId: number;
   chatDisplayName: string | null;
   participants: string[];
+  senderId: string | null;
+  senderDisplayName: string | null;
+  senderHandle: string | null;
   text: string | null;
   isFromMe: boolean;
   sentAt: Date | null;
@@ -55,9 +62,21 @@ export interface GhostingStats {
   theyGhostedMe: number;
 }
 
-export interface ConversationInitiationStats {
+export interface SessionStarterStats {
   startedByMe: number;
   startedByOthers: number;
+}
+
+export type ConversationInitiationStats = SessionStarterStats;
+
+export interface UnansweredStarterStats {
+  youLeftThemHanging: number;
+  theyLeftYouHanging: number;
+}
+
+export interface DoubleTextStats {
+  youDoubleTexted: number;
+  theyDoubleTexted: number;
 }
 
 export interface ResponseDirectionStats {
@@ -105,9 +124,11 @@ export interface ChatSummary {
   receivedCount: number;
   firstMessageAt: Date | null;
   lastMessageAt: Date | null;
-  ghosting: GhostingStats;
-  conversationInitiation: ConversationInitiationStats;
-  responseTimes: ResponseStats;
+  sessionStarters: SessionStarterStats;
+  unansweredStarters: UnansweredStarterStats;
+  doubleTexts: DoubleTextStats;
+  firstReplyTimes: ResponseStats;
+  inThreadReplyTimes: ResponseStats;
   reactions: ReactionTotals;
   reactionParticipants: ChatReactionParticipantStats[];
   messageParticipants: ChatParticipantStats[];
@@ -148,9 +169,11 @@ export interface ConversationStats {
   attachmentStats: AttachmentStats;
   earliestMessageAt: Date | null;
   latestMessageAt: Date | null;
-  ghosting: GhostingStats;
-  conversationInitiation: ConversationInitiationStats;
-  responseTimes: ResponseStats;
+  sessionStarters: SessionStarterStats;
+  unansweredStarters: UnansweredStarterStats;
+  doubleTexts: DoubleTextStats;
+  firstReplyTimes: ResponseStats;
+  inThreadReplyTimes: ResponseStats;
 }
 
 export type SerializableChatSummary = Omit<ChatSummary, "lastMessageAt" | "firstMessageAt"> & {

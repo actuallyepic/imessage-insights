@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 type ContactLookup = Map<string, ContactRecord>;
+type ContactHandlesLookup = Map<number, Set<string>>;
 
 interface ContactRecord {
   recordId: number | null;
@@ -16,6 +17,7 @@ export interface ContactMatch {
 }
 
 let cachedLookup: ContactLookup | null = null;
+let cachedHandlesByRecordId: Map<number, string[]> | null = null;
 let attemptedLoad = false;
 
 export function getContactNameForHandle(identifier: string | null | undefined): string | null {
@@ -94,6 +96,15 @@ export function normalizeHandleIdentifier(value: string | null | undefined): str
   return numeric;
 }
 
+export function getHandleIdentifiersForContactRecord(recordId: number): string[] {
+  if (!Number.isFinite(recordId)) {
+    return [];
+  }
+
+  loadContactLookup();
+  return cachedHandlesByRecordId?.get(recordId) ?? [];
+}
+
 function loadContactLookup(): ContactLookup {
   if (cachedLookup) {
     return cachedLookup;
@@ -106,17 +117,21 @@ function loadContactLookup(): ContactLookup {
   attemptedLoad = true;
 
   const lookup: ContactLookup = new Map();
+  const handlesByRecordId: ContactHandlesLookup = new Map();
   const dbPaths = discoverContactDatabases();
 
   for (const dbPath of dbPaths) {
     try {
-      mergeContactsFromDb(dbPath, lookup);
+      mergeContactsFromDb(dbPath, lookup, handlesByRecordId);
     } catch (error) {
       console.warn(`Unable to read contacts database at ${dbPath}:`, error);
     }
   }
 
   cachedLookup = lookup;
+  cachedHandlesByRecordId = new Map(
+    Array.from(handlesByRecordId.entries()).map(([recordId, handles]) => [recordId, Array.from(handles)]),
+  );
   return lookup;
 }
 
@@ -170,7 +185,7 @@ function discoverContactDatabases(): string[] {
   return results;
 }
 
-function mergeContactsFromDb(dbPath: string, lookup: ContactLookup) {
+function mergeContactsFromDb(dbPath: string, lookup: ContactLookup, handlesByRecordId: ContactHandlesLookup) {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     db.pragma("query_only = ON");
@@ -237,7 +252,7 @@ function mergeContactsFromDb(dbPath: string, lookup: ContactLookup) {
           continue;
         }
         const value = extractPhoneNumber(row);
-        addContactValue(lookup, value, name, recordId);
+        addContactValue(lookup, handlesByRecordId, value, name, recordId);
       }
     }
 
@@ -257,7 +272,7 @@ function mergeContactsFromDb(dbPath: string, lookup: ContactLookup) {
         if (!name) {
           continue;
         }
-        addContactValue(lookup, row.ZADDRESSNORMALIZED ?? row.ZADDRESS ?? null, name, recordId);
+        addContactValue(lookup, handlesByRecordId, row.ZADDRESSNORMALIZED ?? row.ZADDRESS ?? null, name, recordId);
       }
     }
 
@@ -277,7 +292,7 @@ function mergeContactsFromDb(dbPath: string, lookup: ContactLookup) {
         if (!name) {
           continue;
         }
-        addContactValue(lookup, row.ZADDRESS ?? null, name, recordId);
+        addContactValue(lookup, handlesByRecordId, row.ZADDRESS ?? null, name, recordId);
       }
     }
   } finally {
@@ -371,6 +386,7 @@ function extractPhoneNumber(row: Record<string, unknown>): string | null {
 
 function addContactValue(
   lookup: ContactLookup,
+  handlesByRecordId: ContactHandlesLookup,
   rawValue: string | null | undefined,
   displayName: string,
   recordId: number | null,
@@ -386,5 +402,11 @@ function addContactValue(
 
   if (!lookup.has(normalized)) {
     lookup.set(normalized, { recordId, displayName });
+  }
+
+  if (recordId !== null && recordId !== undefined) {
+    const existing = handlesByRecordId.get(recordId) ?? new Set<string>();
+    existing.add(normalized);
+    handlesByRecordId.set(recordId, existing);
   }
 }

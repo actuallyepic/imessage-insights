@@ -73,7 +73,12 @@ Start the Next.js dev server:
 npm run dev
 ```
 
-Then open [http://localhost:3000](http://localhost:3000). The dashboard lets you:
+Then open [http://localhost:3000](http://localhost:3000) for the overview, with dedicated pages at:
+
+- `/messages` – iMessage insights dashboard
+- `/calls` – FaceTime + phone call insights
+
+The messages dashboard lets you:
 
 - Run advanced full-text searches (supports boolean/NEAR syntax from SQLite FTS)
 - Filter by chat ID, date range, and sender type

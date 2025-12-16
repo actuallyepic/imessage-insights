@@ -1,8 +1,13 @@
 import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3";
-import { getContactInfoForHandle, getContactNameForHandle, normalizeHandleIdentifier } from "../contacts";
-import { CONVERSATION_GAP_SECONDS, GHOST_RESPONSE_THRESHOLD_SECONDS } from "./constants";
+import {
+  getContactInfoForHandle,
+  getContactNameForHandle,
+  getHandleIdentifiersForContactRecord,
+  normalizeHandleIdentifier,
+} from "../contacts";
+import { REPLY_WINDOW_SECONDS, SESSION_GAP_SECONDS } from "./constants";
 import { getDatabase } from "./db";
-import { fromAppleTimestamp, toAppleTimestamp } from "./dates";
+import { fromAppleTimestamp } from "./dates";
 import {
   type AttachmentStats,
   REACTION_TYPES,
@@ -10,8 +15,10 @@ import {
   type ChatReactionParticipantStats,
   type ChatSummary,
   type ConversationStats,
+  type DoubleTextStats,
   type DailyCount,
   type HourlyCount,
+  type MessageSearchMode,
   type ReactionCountSummary,
   type ReactionTotals,
   type ReactionType,
@@ -19,6 +26,8 @@ import {
   type ResponseDirectionStats,
   type SearchOptions,
   type SearchResultMessage,
+  type SessionStarterStats,
+  type UnansweredStarterStats,
   type WeekdayCount,
 } from "./types";
 
@@ -31,6 +40,30 @@ type ReactionColumnSupport = {
 } | null;
 let cachedReactionColumnSupport: ReactionColumnSupport = null;
 let cachedAttachmentSupport: boolean | null = null;
+let cachedMessageDateScale: number | null = null;
+
+function detectMessageDateScale(db: BetterSqliteDatabase): number {
+  if (cachedMessageDateScale !== null) {
+    return cachedMessageDateScale;
+  }
+
+  try {
+    const row = db
+      .prepare("SELECT date FROM message WHERE date IS NOT NULL ORDER BY date DESC LIMIT 1")
+      .get() as { date?: number | null } | undefined;
+    const sample = typeof row?.date === "number" ? row.date : 0;
+    const abs = Math.abs(sample);
+
+    // Most modern macOS versions store nanoseconds since 2001; older stores use seconds.
+    // Some intermediate builds may store microseconds.
+    cachedMessageDateScale = abs > 1e15 ? 1_000_000_000 : abs > 1e12 ? 1_000_000 : 1;
+  } catch (error) {
+    console.warn("Unable to detect message timestamp scale:", error);
+    cachedMessageDateScale = 1_000_000_000;
+  }
+
+  return cachedMessageDateScale;
+}
 
 function detectFtsSupport(db: BetterSqliteDatabase): boolean {
   if (cachedFtsSupport !== null) {
@@ -190,15 +223,20 @@ function mapReactionTypeCode(code: number | null | undefined): ReactionType | nu
   return REACTION_TYPE_CODE_LOOKUP[Math.abs(code)] ?? null;
 }
 
-function buildFtsQuery(input: string): string {
+function buildFtsQuery(input: string, mode: MessageSearchMode): string {
   const trimmed = input.trim();
   if (!trimmed) return "";
+
+  if (mode === "phrase") {
+    return `"${trimmed.replace(/\"/g, "\"\"")}"`;
+  }
 
   // If the user provides explicit operators or quotes, pass through.
   if (/[\"'()]/.test(trimmed) || /\b(AND|OR|NOT|NEAR)\b/i.test(trimmed)) {
     return trimmed;
   }
 
+  const joiner = mode === "fuzzy" ? " OR " : " AND ";
   return trimmed
     .split(/\s+/)
     .map((token) => {
@@ -209,7 +247,7 @@ function buildFtsQuery(input: string): string {
       }
       return `${token}*`;
     })
-    .join(" AND ");
+    .join(joiner);
 }
 
 function collectParticipants(participantsCsv: string | null): string[] {
@@ -259,7 +297,9 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
   const db = getDatabase();
 
   const {
-    query,
+    query = "",
+    mode = "smart",
+    sender,
     chatId,
     limit = 50,
     offset = 0,
@@ -268,17 +308,24 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
     dateRange,
   } = options;
 
-  if (!query.trim()) {
+  const trimmedQuery = query.trim();
+  const trimmedSender = sender?.trim() ?? "";
+
+  if (!trimmedQuery && !trimmedSender && typeof chatId !== "number") {
     return [];
   }
 
   const ftsSupported = detectFtsSupport(db);
+  const hasDisplayName = detectHandleDisplayName(db);
   const hasDeletionFlag = detectMessageDeletionColumn(db);
-  const ftsQuery = buildFtsQuery(query);
+  const reactionColumnSupport = detectReactionColumns(db);
+  const reactionsSupported =
+    reactionColumnSupport.hasAssociatedGuid && reactionColumnSupport.hasAssociatedType;
 
   const params: Record<string, unknown> = {
     limit,
     offset,
+    dateScale: detectMessageDateScale(db),
   };
 
   const whereClauses: string[] = [];
@@ -286,12 +333,10 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
     whereClauses.push("m.is_deleted = 0");
   }
 
-  if (ftsSupported && ftsQuery) {
-    whereClauses.push("fts MATCH @ftsQuery");
-    params.ftsQuery = ftsQuery;
-  } else {
-    whereClauses.push("m.text LIKE @likeQuery");
-    params.likeQuery = `%${query}%`;
+  if (reactionsSupported) {
+    whereClauses.push(
+      "(m.associated_message_guid IS NULL OR ABS(m.associated_message_type) NOT BETWEEN 2000 AND 2005)",
+    );
   }
 
   if (typeof chatId === "number") {
@@ -307,17 +352,80 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
     return [];
   }
 
+  if (trimmedSender) {
+    params.senderLike = `%${trimmedSender.toLowerCase()}%`;
+    whereClauses.push("m.is_from_me = 0");
+    whereClauses.push(
+      hasDisplayName
+        ? "LOWER(COALESCE(sh.display_name, sh.id)) LIKE @senderLike"
+        : "LOWER(sh.id) LIKE @senderLike",
+    );
+  }
+
+  const isAdvancedFtsQuery = /[\"'()]/.test(trimmedQuery) || /\b(AND|OR|NOT|NEAR)\b/i.test(trimmedQuery);
+  let ftsQuery = "";
+
+  if (trimmedQuery) {
+    if (mode === "exact") {
+      whereClauses.push("m.text IS NOT NULL");
+      params.exactQuery = trimmedQuery;
+      whereClauses.push("m.text = @exactQuery");
+    } else if (mode === "contains" || (mode === "phrase" && !ftsSupported)) {
+      whereClauses.push("m.text IS NOT NULL");
+      params.queryLower = trimmedQuery.toLowerCase();
+      whereClauses.push("instr(LOWER(m.text), @queryLower) > 0");
+    } else {
+      const desiredFtsQuery = buildFtsQuery(trimmedQuery, mode);
+      if (ftsSupported && desiredFtsQuery) {
+        ftsQuery = desiredFtsQuery;
+        whereClauses.push("fts MATCH @ftsQuery");
+        params.ftsQuery = ftsQuery;
+      } else {
+        whereClauses.push("m.text IS NOT NULL");
+        if (isAdvancedFtsQuery) {
+          params.queryLower = trimmedQuery.toLowerCase();
+          whereClauses.push("instr(LOWER(m.text), @queryLower) > 0");
+        } else {
+          const tokens = trimmedQuery
+            .split(/\s+/)
+            .map((token) => token.trim())
+            .filter(Boolean)
+            .map((token) => token.toLowerCase());
+          if (tokens.length === 0) {
+            params.queryLower = trimmedQuery.toLowerCase();
+            whereClauses.push("instr(LOWER(m.text), @queryLower) > 0");
+          } else if (mode === "fuzzy") {
+            const tokenClauses: string[] = [];
+            tokens.forEach((token, index) => {
+              const key = `token${index}`;
+              params[key] = token;
+              tokenClauses.push(`instr(LOWER(m.text), @${key}) > 0`);
+            });
+            whereClauses.push(`(${tokenClauses.join(" OR ")})`);
+          } else {
+            tokens.forEach((token, index) => {
+              const key = `token${index}`;
+              params[key] = token;
+              whereClauses.push(`instr(LOWER(m.text), @${key}) > 0`);
+            });
+          }
+        }
+      }
+    }
+  }
+
   if (dateRange?.start) {
-    params.startDate = toAppleTimestamp(dateRange.start);
-    whereClauses.push("m.date >= @startDate");
+    params.startSeconds = Math.floor(dateRange.start.getTime() / 1000);
+    whereClauses.push("m.date >= ((@startSeconds - 978307200) * @dateScale)");
   }
 
   if (dateRange?.end) {
-    params.endDate = toAppleTimestamp(dateRange.end);
-    whereClauses.push("m.date <= @endDate");
+    params.endSeconds = Math.ceil(dateRange.end.getTime() / 1000);
+    whereClauses.push("m.date <= ((@endSeconds - 978307200) * @dateScale)");
   }
 
   const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
+  const senderDisplayColumn = hasDisplayName ? "sh.display_name" : "NULL";
 
   const baseSql = `
     SELECT
@@ -325,12 +433,15 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
       c.ROWID AS chatId,
       c.display_name AS chatDisplayName,
       GROUP_CONCAT(DISTINCT h.id) AS participants,
+      MAX(sh.id) AS senderHandleId,
+      MAX(${senderDisplayColumn}) AS senderHandleDisplayName,
       m.text AS text,
       m.is_from_me AS isFromMe,
       m.date AS sentDate
     FROM message m
     JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
     JOIN chat c ON c.ROWID = cmj.chat_id
+    LEFT JOIN handle sh ON sh.ROWID = m.handle_id
     LEFT JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
     LEFT JOIN handle h ON h.ROWID = chj.handle_id
     ${ftsSupported && ftsQuery ? "JOIN message_fts fts ON fts.rowid = m.ROWID" : ""}
@@ -347,6 +458,8 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
       chatId: number;
       chatDisplayName: string | null;
       participants: string | null;
+      senderHandleId: string | null;
+      senderHandleDisplayName: string | null;
       text: string | null;
       isFromMe: number;
       sentDate: number | null;
@@ -357,13 +470,33 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
       const derivedName =
         row.chatDisplayName ?? (participantNames.length === 1 ? participantNames[0] : null);
 
+      const isFromMe = row.isFromMe === 1;
+      const senderHandleId = row.senderHandleId;
+      const senderContactInfo = !isFromMe && senderHandleId ? getContactInfoForHandle(senderHandleId) : null;
+      const normalizedSenderHandle = senderHandleId ? normalizeHandleIdentifier(senderHandleId) ?? senderHandleId : null;
+      const senderId = isFromMe
+        ? "me"
+        : senderContactInfo?.recordId !== null && senderContactInfo?.recordId !== undefined
+          ? `contact-${senderContactInfo.recordId}`
+          : normalizedSenderHandle;
+      const senderDisplayName = isFromMe
+        ? "You"
+        : senderContactInfo?.name ??
+          (row.senderHandleDisplayName && row.senderHandleDisplayName !== senderHandleId
+            ? row.senderHandleDisplayName
+            : null) ??
+          senderHandleId;
+
       return {
         messageId: row.messageId,
         chatId: row.chatId,
         chatDisplayName: derivedName,
         participants: participantNames,
+        senderId: senderId ?? null,
+        senderDisplayName: senderDisplayName ?? null,
+        senderHandle: senderHandleId ?? null,
         text: row.text,
-        isFromMe: row.isFromMe === 1,
+        isFromMe,
         sentAt: fromAppleTimestamp(row.sentDate),
       };
     });
@@ -377,6 +510,26 @@ export function searchMessages(options: SearchOptions): SearchResultMessage[] {
   }
 }
 
+export type PersonTimelineBucket = "hour" | "day" | "week" | "month";
+
+export interface PersonMessageTimelinePoint {
+  bucket: string;
+  fromMeCount: number;
+  fromThemCount: number;
+  totalCount: number;
+}
+
+export interface PersonMessageTimeline {
+  bucket: PersonTimelineBucket;
+  points: PersonMessageTimelinePoint[];
+}
+
+export interface PersonMessageTimelineOptions {
+  personKey: string;
+  bucket?: PersonTimelineBucket;
+  dateRange?: { start?: Date; end?: Date };
+}
+
 export interface StatsOptions {
   limit?: number;
   dateRange?: { start?: Date; end?: Date };
@@ -386,20 +539,144 @@ export interface ChatSummaryOptions {
   dateRange?: { start?: Date; end?: Date };
 }
 
-const DAY_BUCKET_EXPR = `
-CASE
-  WHEN ABS(m.date) > 1000000000000 THEN date(m.date / 1000000000 + 978307200, 'unixepoch', 'localtime')
-  WHEN ABS(m.date) > 1000000000 THEN date(m.date / 1000000 + 978307200, 'unixepoch', 'localtime')
-  ELSE date(m.date + 978307200, 'unixepoch', 'localtime')
-END
-`;
-const MESSAGE_SECONDS_EXPR = `
-CASE
-  WHEN ABS(m.date) > 1000000000000 THEN (m.date / 1000000000.0) + 978307200
-  WHEN ABS(m.date) > 1000000000 THEN (m.date / 1000000.0) + 978307200
-  ELSE m.date + 978307200
-END
-`;
+const DAY_BUCKET_EXPR = `date((m.date / @dateScale) + 978307200, 'unixepoch', 'localtime')`;
+const MESSAGE_SECONDS_EXPR = `(m.date / @dateScale) + 978307200`;
+
+function chooseTimelineBucket(options: { bucket?: PersonTimelineBucket; start?: Date; end?: Date }): PersonTimelineBucket {
+  if (options.bucket) return options.bucket;
+
+  const start = options.start;
+  const end = options.end;
+  if (!start || !end) return "month";
+
+  const diffSeconds = (end.getTime() - start.getTime()) / 1000;
+  if (!Number.isFinite(diffSeconds) || diffSeconds <= 0) return "day";
+
+  if (diffSeconds <= 48 * 60 * 60) return "hour";
+  if (diffSeconds <= 90 * 24 * 60 * 60) return "day";
+  if (diffSeconds <= 365 * 24 * 60 * 60) return "week";
+  return "month";
+}
+
+function resolvePersonHandles(personKey: string): string[] {
+  const trimmed = personKey.trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith("contact-")) {
+    const recordId = Number(trimmed.slice("contact-".length));
+    if (!Number.isFinite(recordId)) return [];
+    return getHandleIdentifiersForContactRecord(recordId);
+  }
+
+  const normalized = normalizeHandleIdentifier(trimmed) ?? trimmed;
+  return normalized ? [normalized] : [];
+}
+
+export function getPersonMessageTimeline(options: PersonMessageTimelineOptions): PersonMessageTimeline {
+  const db = getDatabase();
+  const dateScale = detectMessageDateScale(db);
+  const hasDeletionFlag = detectMessageDeletionColumn(db);
+  const reactionColumnSupport = detectReactionColumns(db);
+  const reactionsSupported = reactionColumnSupport.hasAssociatedGuid && reactionColumnSupport.hasAssociatedType;
+
+  const handles = resolvePersonHandles(options.personKey);
+  if (handles.length === 0) {
+    return { bucket: options.bucket ?? "day", points: [] };
+  }
+
+  const start = options.dateRange?.start;
+  const end = options.dateRange?.end;
+  const bucket = chooseTimelineBucket({ bucket: options.bucket, start, end });
+
+  const params: Record<string, unknown> = {
+    dateScale,
+  };
+
+  handles.forEach((handle, index) => {
+    params[`handle${index}`] = handle;
+  });
+  const handlePlaceholders = handles.map((_, index) => `@handle${index}`).join(", ");
+
+  const whereClauses: string[] = ["m.date IS NOT NULL"];
+  if (hasDeletionFlag) {
+    whereClauses.push("m.is_deleted = 0");
+  }
+  if (reactionsSupported) {
+    whereClauses.push(
+      "(m.associated_message_guid IS NULL OR ABS(m.associated_message_type) NOT BETWEEN 2000 AND 2005)",
+    );
+  }
+
+  if (start) {
+    params.startSeconds = Math.floor(start.getTime() / 1000);
+    whereClauses.push("m.date >= ((@startSeconds - 978307200) * @dateScale)");
+  }
+
+  if (end) {
+    params.endSeconds = Math.ceil(end.getTime() / 1000);
+    whereClauses.push("m.date <= ((@endSeconds - 978307200) * @dateScale)");
+  }
+
+  const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
+  const bucketExpr =
+    bucket === "hour"
+      ? `strftime('%Y-%m-%d %H:00', datetime(${MESSAGE_SECONDS_EXPR}, 'unixepoch', 'localtime'))`
+      : bucket === "week"
+        ? `date(datetime(${MESSAGE_SECONDS_EXPR}, 'unixepoch', 'localtime'), 'weekday 0', '-6 days')`
+        : bucket === "month"
+          ? `strftime('%Y-%m', datetime(${MESSAGE_SECONDS_EXPR}, 'unixepoch', 'localtime'))`
+          : DAY_BUCKET_EXPR;
+
+  const sql = `
+    WITH relevant_chats AS (
+      SELECT DISTINCT chj.chat_id AS chatId
+      FROM chat_handle_join chj
+      JOIN handle h ON h.ROWID = chj.handle_id
+      WHERE h.id IN (${handlePlaceholders})
+      UNION
+      SELECT DISTINCT cmj.chat_id AS chatId
+      FROM chat_message_join cmj
+      JOIN message m2 ON m2.ROWID = cmj.message_id
+      JOIN handle h2 ON h2.ROWID = m2.handle_id
+      WHERE h2.id IN (${handlePlaceholders})
+    )
+    SELECT
+      ${bucketExpr} AS bucket,
+      SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS fromMeCount,
+      SUM(CASE WHEN m.is_from_me = 0 AND sender.id IN (${handlePlaceholders}) THEN 1 ELSE 0 END) AS fromThemCount
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    JOIN relevant_chats rc ON rc.chatId = cmj.chat_id
+    LEFT JOIN handle sender ON sender.ROWID = m.handle_id
+    ${whereSql}
+      AND (m.is_from_me = 1 OR sender.id IN (${handlePlaceholders}))
+    GROUP BY bucket
+    HAVING bucket IS NOT NULL
+    ORDER BY bucket ASC
+  `;
+
+  const stmt = db.prepare(sql);
+  const rows = stmt.all(params) as Array<{
+    bucket: string | null;
+    fromMeCount: number | null;
+    fromThemCount: number | null;
+  }>;
+
+  const points: PersonMessageTimelinePoint[] = rows
+    .filter((row) => Boolean(row.bucket))
+    .map((row) => {
+      const fromMeCount = row.fromMeCount ?? 0;
+      const fromThemCount = row.fromThemCount ?? 0;
+      return {
+        bucket: row.bucket as string,
+        fromMeCount,
+        fromThemCount,
+        totalCount: fromMeCount + fromThemCount,
+      };
+    });
+
+  return { bucket, points };
+}
 
 function createEmptyResponseDirectionStats(): ResponseDirectionStats {
   return {
@@ -422,6 +699,7 @@ function createEmptyResponseStats(): ResponseStats {
 export function getConversationStats(options: StatsOptions = {}): ConversationStats {
   const db = getDatabase();
   const { limit = 15, dateRange } = options;
+  const dateScale = detectMessageDateScale(db);
   const hasDisplayName = detectHandleDisplayName(db);
   const hasDeletionFlag = detectMessageDeletionColumn(db);
   const reactionColumnSupport = detectReactionColumns(db);
@@ -430,11 +708,22 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const attachmentsSupported = detectAttachmentSupport(db);
   const participantLimit = Math.max(limit * 3, limit);
 
+  const analysisStartSeconds = dateRange?.start ? Math.floor(dateRange.start.getTime() / 1000) : null;
+  const analysisEndSeconds = Math.floor((dateRange?.end ?? new Date()).getTime() / 1000);
+  const lookbackStartSeconds =
+    analysisStartSeconds !== null ? analysisStartSeconds - SESSION_GAP_SECONDS : null;
+  const replyCutoffSeconds = analysisEndSeconds - REPLY_WINDOW_SECONDS;
+
   const params: Record<string, unknown> = {
     limit,
     participantLimit,
-    conversationGap: CONVERSATION_GAP_SECONDS,
-    ghostThreshold: GHOST_RESPONSE_THRESHOLD_SECONDS,
+    sessionGap: SESSION_GAP_SECONDS,
+    replyWindow: REPLY_WINDOW_SECONDS,
+    analysisStartSeconds,
+    analysisEndSeconds,
+    lookbackStartSeconds,
+    replyCutoffSeconds,
+    dateScale,
   };
   const messageWhere: string[] = [];
   if (hasDeletionFlag) {
@@ -442,13 +731,13 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   }
 
   if (dateRange?.start) {
-    params.start = toAppleTimestamp(dateRange.start);
-    messageWhere.push("m.date >= @start");
+    params.startSeconds = analysisStartSeconds;
+    messageWhere.push("m.date >= ((@startSeconds - 978307200) * @dateScale)");
   }
 
   if (dateRange?.end) {
-    params.end = toAppleTimestamp(dateRange.end);
-    messageWhere.push("m.date <= @end");
+    params.endSeconds = analysisEndSeconds;
+    messageWhere.push("m.date <= ((@endSeconds - 978307200) * @dateScale)");
   }
 
   const buildWhereClause = (...additional: string[]) => {
@@ -626,139 +915,198 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     ORDER BY attachmentCount DESC
   `
     : null;
-  const conversationDynamicsSql = `
-    WITH ordered AS (
+  const sessionFilters: string[] = [];
+  if (hasDeletionFlag) {
+    sessionFilters.push("m.is_deleted = 0");
+  }
+  sessionFilters.push("m.date IS NOT NULL");
+  sessionFilters.push("m.date <= ((@analysisEndSeconds - 978307200) * @dateScale)");
+  sessionFilters.push(
+    "(@lookbackStartSeconds IS NULL OR m.date >= ((@lookbackStartSeconds - 978307200) * @dateScale))",
+  );
+  if (reactionsSupported) {
+    sessionFilters.push(
+      "(m.associated_message_guid IS NULL OR ABS(m.associated_message_type) NOT BETWEEN 2000 AND 2005)",
+    );
+  }
+  const sessionMessageWhereSql = sessionFilters.length ? `WHERE ${sessionFilters.join(" AND ")}` : "";
+
+  const sessionMetricsSql = `
+    WITH messages AS (
       SELECT
         cmj.chat_id AS chatId,
+        m.ROWID AS messageId,
         m.is_from_me AS isFromMe,
-        ${MESSAGE_SECONDS_EXPR} AS messageSeconds,
-        CASE
-          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) IS NULL THEN 1
-          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) != m.is_from_me THEN 1
-          ELSE 0
-        END AS isTurnBreak
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds
       FROM message m
       JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-      ${messageWhereSql}
+      ${sessionMessageWhereSql}
     ),
-    turns AS (
+    ordered AS (
       SELECT
         chatId,
+        messageId,
         isFromMe,
-        turnIndex,
-        MIN(messageSeconds) AS turnStart,
-        MAX(messageSeconds) AS turnEnd
-      FROM (
-        SELECT
-          chatId,
-          isFromMe,
-          SUM(isTurnBreak) OVER (PARTITION BY chatId ORDER BY messageSeconds ROWS UNBOUNDED PRECEDING) AS turnIndex,
-          messageSeconds
-        FROM ordered
-      )
-      GROUP BY chatId, isFromMe, turnIndex
+        messageSeconds,
+        LAG(messageSeconds) OVER (PARTITION BY chatId ORDER BY messageSeconds, messageId) AS prevSeconds,
+        MIN(CASE WHEN isFromMe = 1 THEN messageSeconds END) OVER (
+          PARTITION BY chatId
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextMeSeconds,
+        MIN(CASE WHEN isFromMe = 0 THEN messageSeconds END) OVER (
+          PARTITION BY chatId
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextThemSeconds
+      FROM messages
     ),
-    turn_sequence AS (
+    session_starts AS (
       SELECT
         chatId,
-        isFromMe,
-        turnStart,
-        turnEnd,
-        LEAD(turnStart) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextTurnStart,
-        LEAD(isFromMe) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextIsFromMe,
-        LAG(turnEnd) OVER (PARTITION BY chatId ORDER BY turnStart) AS prevTurnEnd
-      FROM turns
+        messageSeconds AS sessionStart,
+        isFromMe AS starterIsMe,
+        CASE
+          WHEN prevSeconds IS NULL OR messageSeconds - prevSeconds > @sessionGap THEN 1
+          ELSE 0
+        END AS isSessionStart,
+        nextMeSeconds,
+        nextThemSeconds
+      FROM ordered
+    ),
+    starts_in_range AS (
+      SELECT
+        chatId,
+        sessionStart,
+        starterIsMe,
+        CASE WHEN starterIsMe = 1 THEN nextThemSeconds ELSE nextMeSeconds END AS replyAt,
+        CASE WHEN starterIsMe = 1 THEN nextMeSeconds ELSE nextThemSeconds END AS nextFromStarter
+      FROM session_starts
+      WHERE isSessionStart = 1
+        AND (@analysisStartSeconds IS NULL OR sessionStart >= @analysisStartSeconds)
+        AND sessionStart <= @analysisEndSeconds
+    ),
+    evaluated AS (
+      SELECT
+        chatId,
+        sessionStart,
+        starterIsMe,
+        CASE
+          WHEN replyAt IS NOT NULL AND replyAt - sessionStart <= @replyWindow THEN replyAt
+          ELSE NULL
+        END AS replyAtWithinWindow,
+        nextFromStarter,
+        CASE
+          WHEN sessionStart <= @replyCutoffSeconds THEN 1
+          ELSE 0
+        END AS isEvaluable
+      FROM starts_in_range
     )
     SELECT
       chatId,
+      SUM(CASE WHEN starterIsMe = 1 THEN 1 ELSE 0 END) AS startedByMe,
+      SUM(CASE WHEN starterIsMe = 0 THEN 1 ELSE 0 END) AS startedByOthers,
       SUM(
         CASE
-          WHEN isFromMe = 1 AND (nextTurnStart IS NULL OR nextTurnStart - turnEnd >= @ghostThreshold) THEN 1
+          WHEN isEvaluable = 1 AND starterIsMe = 1 AND replyAtWithinWindow IS NULL THEN 1
           ELSE 0
         END
-      ) AS iWasGhosted,
+      ) AS theyLeftYouHanging,
       SUM(
         CASE
-          WHEN isFromMe = 0 AND (nextTurnStart IS NULL OR nextTurnStart - turnEnd >= @ghostThreshold) THEN 1
+          WHEN isEvaluable = 1 AND starterIsMe = 0 AND replyAtWithinWindow IS NULL THEN 1
           ELSE 0
         END
-      ) AS iGhostedSomeone,
+      ) AS youLeftThemHanging,
       SUM(
         CASE
-          WHEN (prevTurnEnd IS NULL OR turnStart - prevTurnEnd >= @conversationGap) AND isFromMe = 1 THEN 1
+          WHEN isEvaluable = 1
+            AND starterIsMe = 1
+            AND nextFromStarter IS NOT NULL
+            AND nextFromStarter - sessionStart <= @replyWindow
+            AND (replyAtWithinWindow IS NULL OR nextFromStarter < replyAtWithinWindow)
+          THEN 1
           ELSE 0
         END
-      ) AS conversationsStartedByMe,
+      ) AS youDoubleTexted,
       SUM(
         CASE
-          WHEN (prevTurnEnd IS NULL OR turnStart - prevTurnEnd >= @conversationGap) AND isFromMe = 0 THEN 1
+          WHEN isEvaluable = 1
+            AND starterIsMe = 0
+            AND nextFromStarter IS NOT NULL
+            AND nextFromStarter - sessionStart <= @replyWindow
+            AND (replyAtWithinWindow IS NULL OR nextFromStarter < replyAtWithinWindow)
+          THEN 1
           ELSE 0
         END
-      ) AS conversationsStartedByOthers
-    FROM turn_sequence
+      ) AS theyDoubleTexted
+    FROM evaluated
     GROUP BY chatId
   `;
-  const responseStatsSql = `
-    WITH ordered AS (
+
+  const firstReplyStatsSql = `
+    WITH messages AS (
       SELECT
         cmj.chat_id AS chatId,
+        m.ROWID AS messageId,
         m.is_from_me AS isFromMe,
-        ${MESSAGE_SECONDS_EXPR} AS messageSeconds,
-        CASE
-          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) IS NULL THEN 1
-          WHEN LAG(m.is_from_me) OVER (PARTITION BY cmj.chat_id ORDER BY m.date, m.ROWID) != m.is_from_me THEN 1
-          ELSE 0
-        END AS isTurnBreak
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds
       FROM message m
       JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-      ${messageWhereSql}
+      ${sessionMessageWhereSql}
     ),
-    turns AS (
+    ordered AS (
       SELECT
         chatId,
+        messageId,
         isFromMe,
-        turnIndex,
-        MIN(messageSeconds) AS turnStart,
-        MAX(messageSeconds) AS turnEnd
-      FROM (
-        SELECT
-          chatId,
-          isFromMe,
-          SUM(isTurnBreak) OVER (PARTITION BY chatId ORDER BY messageSeconds ROWS UNBOUNDED PRECEDING) AS turnIndex,
-          messageSeconds
-        FROM ordered
-      )
-      GROUP BY chatId, isFromMe, turnIndex
+        messageSeconds,
+        LAG(messageSeconds) OVER (PARTITION BY chatId ORDER BY messageSeconds, messageId) AS prevSeconds,
+        MIN(CASE WHEN isFromMe = 1 THEN messageSeconds END) OVER (
+          PARTITION BY chatId
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextMeSeconds,
+        MIN(CASE WHEN isFromMe = 0 THEN messageSeconds END) OVER (
+          PARTITION BY chatId
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextThemSeconds
+      FROM messages
     ),
-    turn_sequence AS (
+    session_starts AS (
       SELECT
         chatId,
-        isFromMe,
-        turnStart,
-        turnEnd,
-        LEAD(turnStart) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextTurnStart,
-        LEAD(isFromMe) OVER (PARTITION BY chatId ORDER BY turnStart) AS nextIsFromMe
-      FROM turns
-    ),
-    responses AS (
-      SELECT
-        chatId,
+        messageSeconds AS sessionStart,
+        isFromMe AS starterIsMe,
         CASE
-          WHEN isFromMe = 0 AND nextIsFromMe = 1 THEN 1
-          WHEN isFromMe = 1 AND nextIsFromMe = 0 THEN 0
-        END AS responderIsMe,
-        nextTurnStart - turnEnd AS responseSeconds
-      FROM turn_sequence
-      WHERE nextTurnStart IS NOT NULL
-        AND nextIsFromMe IS NOT NULL
-        AND nextIsFromMe != isFromMe
-        AND nextTurnStart - turnEnd > 0
-        AND nextTurnStart - turnEnd < @conversationGap
+          WHEN prevSeconds IS NULL OR messageSeconds - prevSeconds > @sessionGap THEN 1
+          ELSE 0
+        END AS isSessionStart,
+        nextMeSeconds,
+        nextThemSeconds
+      FROM ordered
     ),
-    responses_clean AS (
-      SELECT chatId, responderIsMe, responseSeconds
-      FROM responses
-      WHERE responderIsMe IS NOT NULL
+    starts_in_range AS (
+      SELECT
+        chatId,
+        sessionStart,
+        starterIsMe,
+        CASE WHEN starterIsMe = 1 THEN nextThemSeconds ELSE nextMeSeconds END AS replyAt
+      FROM session_starts
+      WHERE isSessionStart = 1
+        AND (@analysisStartSeconds IS NULL OR sessionStart >= @analysisStartSeconds)
+        AND sessionStart <= @replyCutoffSeconds
+    ),
+    replies AS (
+      SELECT
+        chatId,
+        CASE WHEN starterIsMe = 0 THEN 1 ELSE 0 END AS responderIsMe,
+        replyAt - sessionStart AS responseSeconds
+      FROM starts_in_range
+      WHERE replyAt IS NOT NULL
+        AND replyAt - sessionStart > 0
+        AND replyAt - sessionStart <= @replyWindow
     ),
     ranked AS (
       SELECT
@@ -767,7 +1115,7 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
         responseSeconds,
         ROW_NUMBER() OVER (PARTITION BY chatId, responderIsMe ORDER BY responseSeconds) AS rn,
         COUNT(*) OVER (PARTITION BY chatId, responderIsMe) AS cnt
-      FROM responses_clean
+      FROM replies
       UNION ALL
       SELECT
         NULL AS chatId,
@@ -775,7 +1123,82 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
         responseSeconds,
         ROW_NUMBER() OVER (PARTITION BY responderIsMe ORDER BY responseSeconds) AS rn,
         COUNT(*) OVER (PARTITION BY responderIsMe) AS cnt
-      FROM responses_clean
+      FROM replies
+    )
+    SELECT
+      chatId,
+      responderIsMe,
+      MAX(cnt) AS sampleCount,
+      AVG(responseSeconds) AS averageSeconds,
+      MIN(responseSeconds) AS minSeconds,
+      MAX(responseSeconds) AS maxSeconds,
+      SUM(
+        CASE
+          WHEN cnt % 2 = 1 AND rn = (cnt + 1) / 2 THEN responseSeconds
+          WHEN cnt % 2 = 0 AND rn IN (cnt / 2, cnt / 2 + 1) THEN responseSeconds / 2.0
+          ELSE 0
+        END
+      ) AS medianSeconds,
+      MIN(
+        CASE
+          WHEN rn = ((cnt * 9 + 9) / 10) THEN responseSeconds
+        END
+      ) AS p90Seconds
+    FROM ranked
+    GROUP BY chatId, responderIsMe
+  `;
+
+  const inThreadReplyStatsSql = `
+    WITH messages AS (
+      SELECT
+        cmj.chat_id AS chatId,
+        m.ROWID AS messageId,
+        m.is_from_me AS isFromMe,
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      ${sessionMessageWhereSql}
+    ),
+    ordered AS (
+      SELECT
+        chatId,
+        messageId,
+        isFromMe,
+        messageSeconds,
+        LAG(messageSeconds) OVER (PARTITION BY chatId ORDER BY messageSeconds, messageId) AS prevSeconds,
+        LAG(isFromMe) OVER (PARTITION BY chatId ORDER BY messageSeconds, messageId) AS prevIsFromMe
+      FROM messages
+    ),
+    replies AS (
+      SELECT
+        chatId,
+        isFromMe AS responderIsMe,
+        messageSeconds - prevSeconds AS responseSeconds
+      FROM ordered
+      WHERE prevSeconds IS NOT NULL
+        AND prevIsFromMe IS NOT NULL
+        AND prevIsFromMe != isFromMe
+        AND messageSeconds - prevSeconds > 0
+        AND messageSeconds - prevSeconds <= @sessionGap
+        AND (@analysisStartSeconds IS NULL OR messageSeconds >= @analysisStartSeconds)
+        AND messageSeconds <= @analysisEndSeconds
+    ),
+    ranked AS (
+      SELECT
+        chatId,
+        responderIsMe,
+        responseSeconds,
+        ROW_NUMBER() OVER (PARTITION BY chatId, responderIsMe ORDER BY responseSeconds) AS rn,
+        COUNT(*) OVER (PARTITION BY chatId, responderIsMe) AS cnt
+      FROM replies
+      UNION ALL
+      SELECT
+        NULL AS chatId,
+        responderIsMe,
+        responseSeconds,
+        ROW_NUMBER() OVER (PARTITION BY responderIsMe ORDER BY responseSeconds) AS rn,
+        COUNT(*) OVER (PARTITION BY responderIsMe) AS cnt
+      FROM replies
     )
     SELECT
       chatId,
@@ -809,8 +1232,9 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const earliestStmt = db.prepare(earliestSql);
   const reactionTotalsStmt = reactionTotalsSql ? db.prepare(reactionTotalsSql) : null;
   const attachmentStmt = attachmentsSql ? db.prepare(attachmentsSql) : null;
-  const conversationDynamicsStmt = db.prepare(conversationDynamicsSql);
-  const responseStatsStmt = db.prepare(responseStatsSql);
+  const sessionMetricsStmt = db.prepare(sessionMetricsSql);
+  const firstReplyStatsStmt = db.prepare(firstReplyStatsSql);
+  const inThreadReplyStatsStmt = db.prepare(inThreadReplyStatsSql);
 
   const topChatsRows = topChatsStmt.all(params) as {
     chatId: number;
@@ -859,14 +1283,26 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   const earliestRow = earliestStmt.get(params) as {
     earliestMessageDate: number | null;
   } | undefined;
-  const conversationDynamicsRows = conversationDynamicsStmt.all(params) as Array<{
-    chatId: number | null;
-    iWasGhosted: number | null;
-    iGhostedSomeone: number | null;
-    conversationsStartedByMe: number | null;
-    conversationsStartedByOthers: number | null;
+  const sessionMetricsRows = sessionMetricsStmt.all(params) as Array<{
+    chatId: number;
+    startedByMe: number | null;
+    startedByOthers: number | null;
+    theyLeftYouHanging: number | null;
+    youLeftThemHanging: number | null;
+    youDoubleTexted: number | null;
+    theyDoubleTexted: number | null;
   }>;
-  const responseStatsRows = responseStatsStmt.all(params) as Array<{
+  const firstReplyStatsRows = firstReplyStatsStmt.all(params) as Array<{
+    chatId: number | null;
+    responderIsMe: number;
+    sampleCount: number | null;
+    averageSeconds: number | null;
+    minSeconds: number | null;
+    maxSeconds: number | null;
+    medianSeconds: number | null;
+    p90Seconds: number | null;
+  }>;
+  const inThreadReplyStatsRows = inThreadReplyStatsStmt.all(params) as Array<{
     chatId: number | null;
     responderIsMe: number;
     sampleCount: number | null;
@@ -948,37 +1384,49 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
   }
   const earliestMessageAt = fromAppleTimestamp(earliestRow?.earliestMessageDate ?? null);
   const latestMessageAt = fromAppleTimestamp(totalsRow?.latestMessageDate ?? null);
-  const conversationDynamicsByChat = new Map<
+  const sessionStarters: SessionStarterStats = { startedByMe: 0, startedByOthers: 0 };
+  const unansweredStarters: UnansweredStarterStats = { youLeftThemHanging: 0, theyLeftYouHanging: 0 };
+  const doubleTexts: DoubleTextStats = { youDoubleTexted: 0, theyDoubleTexted: 0 };
+  const sessionMetricsByChat = new Map<
     number,
     {
-      ghosting: GhostingStats;
-      conversationInitiation: ConversationInitiationStats;
+      sessionStarters: SessionStarterStats;
+      unansweredStarters: UnansweredStarterStats;
+      doubleTexts: DoubleTextStats;
     }
   >();
-  const ghostingStats: GhostingStats = { iGhosted: 0, theyGhostedMe: 0 };
-  const conversationInitiation: ConversationInitiationStats = { startedByMe: 0, startedByOthers: 0 };
-  for (const row of conversationDynamicsRows) {
-    if (!row || row.chatId === null || row.chatId === undefined) continue;
-    const ghosting = {
-      iGhosted: row.iGhostedSomeone ?? 0,
-      theyGhostedMe: row.iWasGhosted ?? 0,
+
+  for (const row of sessionMetricsRows) {
+    const starters = {
+      startedByMe: row.startedByMe ?? 0,
+      startedByOthers: row.startedByOthers ?? 0,
     };
-    const conversation = {
-      startedByMe: row.conversationsStartedByMe ?? 0,
-      startedByOthers: row.conversationsStartedByOthers ?? 0,
+    const unanswered = {
+      youLeftThemHanging: row.youLeftThemHanging ?? 0,
+      theyLeftYouHanging: row.theyLeftYouHanging ?? 0,
     };
-    ghostingStats.iGhosted += ghosting.iGhosted;
-    ghostingStats.theyGhostedMe += ghosting.theyGhostedMe;
-    conversationInitiation.startedByMe += conversation.startedByMe;
-    conversationInitiation.startedByOthers += conversation.startedByOthers;
-    conversationDynamicsByChat.set(row.chatId, {
-      ghosting,
-      conversationInitiation: conversation,
+    const doubles = {
+      youDoubleTexted: row.youDoubleTexted ?? 0,
+      theyDoubleTexted: row.theyDoubleTexted ?? 0,
+    };
+
+    sessionStarters.startedByMe += starters.startedByMe;
+    sessionStarters.startedByOthers += starters.startedByOthers;
+    unansweredStarters.youLeftThemHanging += unanswered.youLeftThemHanging;
+    unansweredStarters.theyLeftYouHanging += unanswered.theyLeftYouHanging;
+    doubleTexts.youDoubleTexted += doubles.youDoubleTexted;
+    doubleTexts.theyDoubleTexted += doubles.theyDoubleTexted;
+
+    sessionMetricsByChat.set(row.chatId, {
+      sessionStarters: starters,
+      unansweredStarters: unanswered,
+      doubleTexts: doubles,
     });
   }
-  const responseStatsByChat = new Map<number, ResponseStats>();
-  const overallResponseTimes = createEmptyResponseStats();
-  for (const row of responseStatsRows) {
+
+  const firstReplyTimesByChat = new Map<number, ResponseStats>();
+  const overallFirstReplyTimes = createEmptyResponseStats();
+  for (const row of firstReplyStatsRows) {
     const responderKey = row.responderIsMe === 1 ? "meResponding" : "themResponding";
     const directionStats: ResponseDirectionStats = {
       averageSeconds: row.averageSeconds ?? null,
@@ -989,12 +1437,33 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
       sampleCount: row.sampleCount ?? 0,
     };
     if (row.chatId === null) {
-      overallResponseTimes[responderKey] = directionStats;
+      overallFirstReplyTimes[responderKey] = directionStats;
       continue;
     }
-    const existing = responseStatsByChat.get(row.chatId) ?? createEmptyResponseStats();
+    const existing = firstReplyTimesByChat.get(row.chatId) ?? createEmptyResponseStats();
     existing[responderKey] = directionStats;
-    responseStatsByChat.set(row.chatId, existing);
+    firstReplyTimesByChat.set(row.chatId, existing);
+  }
+
+  const inThreadReplyTimesByChat = new Map<number, ResponseStats>();
+  const overallInThreadReplyTimes = createEmptyResponseStats();
+  for (const row of inThreadReplyStatsRows) {
+    const responderKey = row.responderIsMe === 1 ? "meResponding" : "themResponding";
+    const directionStats: ResponseDirectionStats = {
+      averageSeconds: row.averageSeconds ?? null,
+      medianSeconds: row.medianSeconds ?? null,
+      p90Seconds: row.p90Seconds ?? null,
+      minSeconds: row.minSeconds ?? null,
+      maxSeconds: row.maxSeconds ?? null,
+      sampleCount: row.sampleCount ?? 0,
+    };
+    if (row.chatId === null) {
+      overallInThreadReplyTimes[responderKey] = directionStats;
+      continue;
+    }
+    const existing = inThreadReplyTimesByChat.get(row.chatId) ?? createEmptyResponseStats();
+    existing[responderKey] = directionStats;
+    inThreadReplyTimesByChat.set(row.chatId, existing);
   }
   const reactionTotalsByChat = new Map<number, ReactionTotals>();
   const reactionParticipantsByChat = new Map<number, ChatReactionParticipantStats[]>();
@@ -1239,8 +1708,15 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     const chatReactions: ReactionTotals = reactionTotalsByChat.get(row.chatId) ?? createEmptyReactionTotals();
     const chatReactionParticipants = reactionParticipantsByChat.get(row.chatId) ?? [];
 
-    const dynamics = conversationDynamicsByChat.get(row.chatId);
-    const chatResponseTimes = responseStatsByChat.get(row.chatId) ?? createEmptyResponseStats();
+    const chatMetrics = sessionMetricsByChat.get(row.chatId);
+    const chatSessionStarters = chatMetrics?.sessionStarters ?? { startedByMe: 0, startedByOthers: 0 };
+    const chatUnansweredStarters = chatMetrics?.unansweredStarters ?? {
+      youLeftThemHanging: 0,
+      theyLeftYouHanging: 0,
+    };
+    const chatDoubleTexts = chatMetrics?.doubleTexts ?? { youDoubleTexted: 0, theyDoubleTexted: 0 };
+    const chatFirstReplyTimes = firstReplyTimesByChat.get(row.chatId) ?? createEmptyResponseStats();
+    const chatInThreadReplyTimes = inThreadReplyTimesByChat.get(row.chatId) ?? createEmptyResponseStats();
 
     return {
       chatId: row.chatId,
@@ -1252,9 +1728,11 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
       receivedCount: row.receivedCount,
       firstMessageAt: fromAppleTimestamp(row.firstMessageDate),
       lastMessageAt: fromAppleTimestamp(row.lastMessageDate),
-      ghosting: dynamics?.ghosting ?? { iGhosted: 0, theyGhostedMe: 0 },
-      conversationInitiation: dynamics?.conversationInitiation ?? { startedByMe: 0, startedByOthers: 0 },
-      responseTimes: chatResponseTimes,
+      sessionStarters: chatSessionStarters,
+      unansweredStarters: chatUnansweredStarters,
+      doubleTexts: chatDoubleTexts,
+      firstReplyTimes: chatFirstReplyTimes,
+      inThreadReplyTimes: chatInThreadReplyTimes,
       reactions: chatReactions,
       reactionParticipants: chatReactionParticipants,
       messageParticipants: messageParticipantsByChat.get(row.chatId) ?? [],
@@ -1336,9 +1814,11 @@ export function getConversationStats(options: StatsOptions = {}): ConversationSt
     attachmentStats,
     earliestMessageAt,
     latestMessageAt,
-    ghosting: ghostingStats,
-    conversationInitiation,
-    responseTimes: overallResponseTimes,
+    sessionStarters,
+    unansweredStarters,
+    doubleTexts,
+    firstReplyTimes: overallFirstReplyTimes,
+    inThreadReplyTimes: overallInThreadReplyTimes,
   };
 }
 
@@ -1349,24 +1829,40 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
 
   const db = getDatabase();
   const { dateRange } = options;
+  const dateScale = detectMessageDateScale(db);
   const hasDisplayName = detectHandleDisplayName(db);
   const hasDeletionFlag = detectMessageDeletionColumn(db);
   const reactionColumnSupport = detectReactionColumns(db);
   const reactionsSupported =
     reactionColumnSupport.hasAssociatedGuid && reactionColumnSupport.hasAssociatedType;
 
-  const params: Record<string, unknown> = { chatId };
+  const analysisStartSeconds = dateRange?.start ? Math.floor(dateRange.start.getTime() / 1000) : null;
+  const analysisEndSeconds = Math.floor((dateRange?.end ?? new Date()).getTime() / 1000);
+  const lookbackStartSeconds =
+    analysisStartSeconds !== null ? analysisStartSeconds - SESSION_GAP_SECONDS : null;
+  const replyCutoffSeconds = analysisEndSeconds - REPLY_WINDOW_SECONDS;
+
+  const params: Record<string, unknown> = {
+    chatId,
+    sessionGap: SESSION_GAP_SECONDS,
+    replyWindow: REPLY_WINDOW_SECONDS,
+    analysisStartSeconds,
+    analysisEndSeconds,
+    lookbackStartSeconds,
+    replyCutoffSeconds,
+    dateScale,
+  };
   const messageFilters: string[] = [];
   if (hasDeletionFlag) {
     messageFilters.push("m.is_deleted = 0");
   }
   if (dateRange?.start) {
-    params.start = toAppleTimestamp(dateRange.start);
-    messageFilters.push("m.date >= @start");
+    params.startSeconds = analysisStartSeconds;
+    messageFilters.push("m.date >= ((@startSeconds - 978307200) * @dateScale)");
   }
   if (dateRange?.end) {
-    params.end = toAppleTimestamp(dateRange.end);
-    messageFilters.push("m.date <= @end");
+    params.endSeconds = analysisEndSeconds;
+    messageFilters.push("m.date <= ((@endSeconds - 978307200) * @dateScale)");
   }
 
   const buildWhereClause = (...additional: string[]) => {
@@ -1381,6 +1877,7 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
       COUNT(m.ROWID) AS messageCount,
       SUM(CASE WHEN m.is_from_me = 1 THEN 1 ELSE 0 END) AS sentCount,
       SUM(CASE WHEN m.is_from_me = 0 THEN 1 ELSE 0 END) AS receivedCount,
+      MIN(m.date) AS firstMessageDate,
       MAX(m.date) AS lastMessageDate
     FROM chat c
     JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
@@ -1467,11 +1964,283 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
   `
     : null;
 
+  const sessionFilters: string[] = ["cmj.chat_id = @chatId"];
+  if (hasDeletionFlag) {
+    sessionFilters.push("m.is_deleted = 0");
+  }
+  sessionFilters.push("m.date IS NOT NULL");
+  sessionFilters.push("m.date <= ((@analysisEndSeconds - 978307200) * @dateScale)");
+  sessionFilters.push(
+    "(@lookbackStartSeconds IS NULL OR m.date >= ((@lookbackStartSeconds - 978307200) * @dateScale))",
+  );
+  if (reactionsSupported) {
+    sessionFilters.push(
+      "(m.associated_message_guid IS NULL OR ABS(m.associated_message_type) NOT BETWEEN 2000 AND 2005)",
+    );
+  }
+  const sessionMessageWhereSql = sessionFilters.length ? `WHERE ${sessionFilters.join(" AND ")}` : "";
+
+  const sessionMetricsSql = `
+    WITH messages AS (
+      SELECT
+        m.ROWID AS messageId,
+        m.is_from_me AS isFromMe,
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      ${sessionMessageWhereSql}
+    ),
+    ordered AS (
+      SELECT
+        messageId,
+        isFromMe,
+        messageSeconds,
+        LAG(messageSeconds) OVER (ORDER BY messageSeconds, messageId) AS prevSeconds,
+        MIN(CASE WHEN isFromMe = 1 THEN messageSeconds END) OVER (
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextMeSeconds,
+        MIN(CASE WHEN isFromMe = 0 THEN messageSeconds END) OVER (
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextThemSeconds
+      FROM messages
+    ),
+    session_starts AS (
+      SELECT
+        messageSeconds AS sessionStart,
+        isFromMe AS starterIsMe,
+        CASE
+          WHEN prevSeconds IS NULL OR messageSeconds - prevSeconds > @sessionGap THEN 1
+          ELSE 0
+        END AS isSessionStart,
+        nextMeSeconds,
+        nextThemSeconds
+      FROM ordered
+    ),
+    starts_in_range AS (
+      SELECT
+        sessionStart,
+        starterIsMe,
+        CASE WHEN starterIsMe = 1 THEN nextThemSeconds ELSE nextMeSeconds END AS replyAt,
+        CASE WHEN starterIsMe = 1 THEN nextMeSeconds ELSE nextThemSeconds END AS nextFromStarter
+      FROM session_starts
+      WHERE isSessionStart = 1
+        AND (@analysisStartSeconds IS NULL OR sessionStart >= @analysisStartSeconds)
+        AND sessionStart <= @analysisEndSeconds
+    ),
+    evaluated AS (
+      SELECT
+        sessionStart,
+        starterIsMe,
+        CASE
+          WHEN replyAt IS NOT NULL AND replyAt - sessionStart <= @replyWindow THEN replyAt
+          ELSE NULL
+        END AS replyAtWithinWindow,
+        nextFromStarter,
+        CASE
+          WHEN sessionStart <= @replyCutoffSeconds THEN 1
+          ELSE 0
+        END AS isEvaluable
+      FROM starts_in_range
+    )
+    SELECT
+      SUM(CASE WHEN starterIsMe = 1 THEN 1 ELSE 0 END) AS startedByMe,
+      SUM(CASE WHEN starterIsMe = 0 THEN 1 ELSE 0 END) AS startedByOthers,
+      SUM(
+        CASE
+          WHEN isEvaluable = 1 AND starterIsMe = 1 AND replyAtWithinWindow IS NULL THEN 1
+          ELSE 0
+        END
+      ) AS theyLeftYouHanging,
+      SUM(
+        CASE
+          WHEN isEvaluable = 1 AND starterIsMe = 0 AND replyAtWithinWindow IS NULL THEN 1
+          ELSE 0
+        END
+      ) AS youLeftThemHanging,
+      SUM(
+        CASE
+          WHEN isEvaluable = 1
+            AND starterIsMe = 1
+            AND nextFromStarter IS NOT NULL
+            AND nextFromStarter - sessionStart <= @replyWindow
+            AND (replyAtWithinWindow IS NULL OR nextFromStarter < replyAtWithinWindow)
+          THEN 1
+          ELSE 0
+        END
+      ) AS youDoubleTexted,
+      SUM(
+        CASE
+          WHEN isEvaluable = 1
+            AND starterIsMe = 0
+            AND nextFromStarter IS NOT NULL
+            AND nextFromStarter - sessionStart <= @replyWindow
+            AND (replyAtWithinWindow IS NULL OR nextFromStarter < replyAtWithinWindow)
+          THEN 1
+          ELSE 0
+        END
+      ) AS theyDoubleTexted
+    FROM evaluated
+  `;
+
+  const firstReplyStatsSql = `
+    WITH messages AS (
+      SELECT
+        m.ROWID AS messageId,
+        m.is_from_me AS isFromMe,
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      ${sessionMessageWhereSql}
+    ),
+    ordered AS (
+      SELECT
+        messageId,
+        isFromMe,
+        messageSeconds,
+        LAG(messageSeconds) OVER (ORDER BY messageSeconds, messageId) AS prevSeconds,
+        MIN(CASE WHEN isFromMe = 1 THEN messageSeconds END) OVER (
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextMeSeconds,
+        MIN(CASE WHEN isFromMe = 0 THEN messageSeconds END) OVER (
+          ORDER BY messageSeconds, messageId
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS nextThemSeconds
+      FROM messages
+    ),
+    session_starts AS (
+      SELECT
+        messageSeconds AS sessionStart,
+        isFromMe AS starterIsMe,
+        CASE
+          WHEN prevSeconds IS NULL OR messageSeconds - prevSeconds > @sessionGap THEN 1
+          ELSE 0
+        END AS isSessionStart,
+        nextMeSeconds,
+        nextThemSeconds
+      FROM ordered
+    ),
+    starts_in_range AS (
+      SELECT
+        sessionStart,
+        starterIsMe,
+        CASE WHEN starterIsMe = 1 THEN nextThemSeconds ELSE nextMeSeconds END AS replyAt
+      FROM session_starts
+      WHERE isSessionStart = 1
+        AND (@analysisStartSeconds IS NULL OR sessionStart >= @analysisStartSeconds)
+        AND sessionStart <= @replyCutoffSeconds
+    ),
+    replies AS (
+      SELECT
+        CASE WHEN starterIsMe = 0 THEN 1 ELSE 0 END AS responderIsMe,
+        replyAt - sessionStart AS responseSeconds
+      FROM starts_in_range
+      WHERE replyAt IS NOT NULL
+        AND replyAt - sessionStart > 0
+        AND replyAt - sessionStart <= @replyWindow
+    ),
+    ranked AS (
+      SELECT
+        responderIsMe,
+        responseSeconds,
+        ROW_NUMBER() OVER (PARTITION BY responderIsMe ORDER BY responseSeconds) AS rn,
+        COUNT(*) OVER (PARTITION BY responderIsMe) AS cnt
+      FROM replies
+    )
+    SELECT
+      responderIsMe,
+      MAX(cnt) AS sampleCount,
+      AVG(responseSeconds) AS averageSeconds,
+      MIN(responseSeconds) AS minSeconds,
+      MAX(responseSeconds) AS maxSeconds,
+      SUM(
+        CASE
+          WHEN cnt % 2 = 1 AND rn = (cnt + 1) / 2 THEN responseSeconds
+          WHEN cnt % 2 = 0 AND rn IN (cnt / 2, cnt / 2 + 1) THEN responseSeconds / 2.0
+          ELSE 0
+        END
+      ) AS medianSeconds,
+      MIN(
+        CASE
+          WHEN rn = ((cnt * 9 + 9) / 10) THEN responseSeconds
+        END
+      ) AS p90Seconds
+    FROM ranked
+    GROUP BY responderIsMe
+  `;
+
+  const inThreadReplyStatsSql = `
+    WITH messages AS (
+      SELECT
+        m.ROWID AS messageId,
+        m.is_from_me AS isFromMe,
+        ${MESSAGE_SECONDS_EXPR} AS messageSeconds
+      FROM message m
+      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      ${sessionMessageWhereSql}
+    ),
+    ordered AS (
+      SELECT
+        messageId,
+        isFromMe,
+        messageSeconds,
+        LAG(messageSeconds) OVER (ORDER BY messageSeconds, messageId) AS prevSeconds,
+        LAG(isFromMe) OVER (ORDER BY messageSeconds, messageId) AS prevIsFromMe
+      FROM messages
+    ),
+    replies AS (
+      SELECT
+        isFromMe AS responderIsMe,
+        messageSeconds - prevSeconds AS responseSeconds
+      FROM ordered
+      WHERE prevSeconds IS NOT NULL
+        AND prevIsFromMe IS NOT NULL
+        AND prevIsFromMe != isFromMe
+        AND messageSeconds - prevSeconds > 0
+        AND messageSeconds - prevSeconds <= @sessionGap
+        AND (@analysisStartSeconds IS NULL OR messageSeconds >= @analysisStartSeconds)
+        AND messageSeconds <= @analysisEndSeconds
+    ),
+    ranked AS (
+      SELECT
+        responderIsMe,
+        responseSeconds,
+        ROW_NUMBER() OVER (PARTITION BY responderIsMe ORDER BY responseSeconds) AS rn,
+        COUNT(*) OVER (PARTITION BY responderIsMe) AS cnt
+      FROM replies
+    )
+    SELECT
+      responderIsMe,
+      MAX(cnt) AS sampleCount,
+      AVG(responseSeconds) AS averageSeconds,
+      MIN(responseSeconds) AS minSeconds,
+      MAX(responseSeconds) AS maxSeconds,
+      SUM(
+        CASE
+          WHEN cnt % 2 = 1 AND rn = (cnt + 1) / 2 THEN responseSeconds
+          WHEN cnt % 2 = 0 AND rn IN (cnt / 2, cnt / 2 + 1) THEN responseSeconds / 2.0
+          ELSE 0
+        END
+      ) AS medianSeconds,
+      MIN(
+        CASE
+          WHEN rn = ((cnt * 9 + 9) / 10) THEN responseSeconds
+        END
+      ) AS p90Seconds
+    FROM ranked
+    GROUP BY responderIsMe
+  `;
+
   const statsStmt = db.prepare(statsSql);
   const participantsStmt = db.prepare(participantsSql);
   const messageParticipantsStmt = db.prepare(messageParticipantsSql);
   const reactionTotalsStmt = reactionTotalsSql ? db.prepare(reactionTotalsSql) : null;
   const reactionParticipantsStmt = reactionParticipantsSql ? db.prepare(reactionParticipantsSql) : null;
+  const sessionMetricsStmt = db.prepare(sessionMetricsSql);
+  const firstReplyStatsStmt = db.prepare(firstReplyStatsSql);
+  const inThreadReplyStatsStmt = db.prepare(inThreadReplyStatsSql);
 
   let fallbackChatDisplayName: string | null = null;
 
@@ -1481,6 +2250,7 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
     messageCount: number | null;
     sentCount: number | null;
     receivedCount: number | null;
+    firstMessageDate: number | null;
     lastMessageDate: number | null;
   } | undefined;
 
@@ -1514,7 +2284,77 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
     sentCount: statsRow?.sentCount ?? 0,
     receivedCount: statsRow?.receivedCount ?? 0,
   };
+  const firstMessageAt = fromAppleTimestamp(statsRow?.firstMessageDate ?? null);
   const lastMessageAt = fromAppleTimestamp(statsRow?.lastMessageDate ?? null);
+  const sessionStarters: SessionStarterStats = { startedByMe: 0, startedByOthers: 0 };
+  const unansweredStarters: UnansweredStarterStats = { youLeftThemHanging: 0, theyLeftYouHanging: 0 };
+  const doubleTexts: DoubleTextStats = { youDoubleTexted: 0, theyDoubleTexted: 0 };
+  const firstReplyTimes = createEmptyResponseStats();
+  const inThreadReplyTimes = createEmptyResponseStats();
+
+  const sessionMetricsRow = sessionMetricsStmt.get(params) as
+    | {
+        startedByMe: number | null;
+        startedByOthers: number | null;
+        theyLeftYouHanging: number | null;
+        youLeftThemHanging: number | null;
+        youDoubleTexted: number | null;
+        theyDoubleTexted: number | null;
+      }
+    | undefined;
+
+  if (sessionMetricsRow) {
+    sessionStarters.startedByMe = sessionMetricsRow.startedByMe ?? 0;
+    sessionStarters.startedByOthers = sessionMetricsRow.startedByOthers ?? 0;
+    unansweredStarters.youLeftThemHanging = sessionMetricsRow.youLeftThemHanging ?? 0;
+    unansweredStarters.theyLeftYouHanging = sessionMetricsRow.theyLeftYouHanging ?? 0;
+    doubleTexts.youDoubleTexted = sessionMetricsRow.youDoubleTexted ?? 0;
+    doubleTexts.theyDoubleTexted = sessionMetricsRow.theyDoubleTexted ?? 0;
+  }
+
+  const firstReplyStatsRows = firstReplyStatsStmt.all(params) as Array<{
+    responderIsMe: number;
+    sampleCount: number | null;
+    averageSeconds: number | null;
+    minSeconds: number | null;
+    maxSeconds: number | null;
+    medianSeconds: number | null;
+    p90Seconds: number | null;
+  }>;
+
+  for (const row of firstReplyStatsRows) {
+    const responderKey = row.responderIsMe === 1 ? "meResponding" : "themResponding";
+    firstReplyTimes[responderKey] = {
+      averageSeconds: row.averageSeconds ?? null,
+      medianSeconds: row.medianSeconds ?? null,
+      p90Seconds: row.p90Seconds ?? null,
+      minSeconds: row.minSeconds ?? null,
+      maxSeconds: row.maxSeconds ?? null,
+      sampleCount: row.sampleCount ?? 0,
+    };
+  }
+
+  const inThreadReplyStatsRows = inThreadReplyStatsStmt.all(params) as Array<{
+    responderIsMe: number;
+    sampleCount: number | null;
+    averageSeconds: number | null;
+    minSeconds: number | null;
+    maxSeconds: number | null;
+    medianSeconds: number | null;
+    p90Seconds: number | null;
+  }>;
+
+  for (const row of inThreadReplyStatsRows) {
+    const responderKey = row.responderIsMe === 1 ? "meResponding" : "themResponding";
+    inThreadReplyTimes[responderKey] = {
+      averageSeconds: row.averageSeconds ?? null,
+      medianSeconds: row.medianSeconds ?? null,
+      p90Seconds: row.p90Seconds ?? null,
+      minSeconds: row.minSeconds ?? null,
+      maxSeconds: row.maxSeconds ?? null,
+      sampleCount: row.sampleCount ?? 0,
+    };
+  }
 
   const messageParticipantRows = messageParticipantsStmt.all(params) as {
     handleId: string | null;
@@ -1670,7 +2510,13 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
     messageCount: totals.messageCount,
     sentCount: totals.sentCount,
     receivedCount: totals.receivedCount,
+    firstMessageAt,
     lastMessageAt,
+    sessionStarters,
+    unansweredStarters,
+    doubleTexts,
+    firstReplyTimes,
+    inThreadReplyTimes,
     reactions: reactionTotals,
     reactionParticipants,
     messageParticipants,

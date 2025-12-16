@@ -103,10 +103,10 @@ export default async function ReportPage({ params, searchParams }: ReportPagePro
             We couldn&apos;t find any messages for this chat. Make sure you shared the correct link and try again.
           </p>
           <Link
-            href="/"
+            href="/messages"
             className="inline-flex items-center justify-center rounded-full border border-emerald-400/50 px-4 py-1.5 text-sm font-semibold text-emerald-200 transition hover:border-emerald-300 hover:text-white"
           >
-            Return to dashboard
+            Back to messages
           </Link>
         </div>
       </main>
@@ -315,13 +315,13 @@ export default async function ReportPage({ params, searchParams }: ReportPagePro
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Quick stats</p>
-              <p className="text-sm text-neutral-300">Automatic snapshot of your chat health.</p>
+              <p className="text-sm text-neutral-300">Snapshot for this chat.</p>
             </div>
             <Link
-              href="/"
+              href="/messages"
               className="inline-flex items-center gap-2 rounded-full border border-white/20 px-4 py-1.5 text-sm font-semibold text-neutral-100 transition hover:border-emerald-400/60 hover:text-emerald-100"
             >
-              Back to dashboard
+              Back to messages
               <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
                 <path
                   fill="currentColor"
