@@ -1,4 +1,5 @@
 import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3";
+import { Unarchiver } from "node-typedstream";
 import {
   getContactInfoForHandle,
   getContactNameForHandle,
@@ -41,6 +42,7 @@ type ReactionColumnSupport = {
 let cachedReactionColumnSupport: ReactionColumnSupport = null;
 let cachedAttachmentSupport: boolean | null = null;
 let cachedMessageDateScale: number | null = null;
+let cachedAttributedBodySupport: boolean | null = null;
 
 function detectMessageDateScale(db: BetterSqliteDatabase): number {
   if (cachedMessageDateScale !== null) {
@@ -163,6 +165,23 @@ function detectAttachmentSupport(db: BetterSqliteDatabase): boolean {
   }
 
   return cachedAttachmentSupport;
+}
+
+function detectAttributedBodySupport(db: BetterSqliteDatabase): boolean {
+  if (cachedAttributedBodySupport !== null) {
+    return cachedAttributedBodySupport;
+  }
+
+  try {
+    const stmt: Statement = db.prepare("PRAGMA table_info(message)");
+    const rows = stmt.all() as { name: string }[];
+    cachedAttributedBodySupport = rows.some((row) => row.name === "attributedBody");
+  } catch (error) {
+    console.warn("Unable to inspect message table columns for attributedBody:", error);
+    cachedAttributedBodySupport = false;
+  }
+
+  return cachedAttributedBodySupport;
 }
 
 const REACTION_TYPE_CODE_LOOKUP: Record<number, ReactionType> = {
@@ -539,8 +558,295 @@ export interface ChatSummaryOptions {
   dateRange?: { start?: Date; end?: Date };
 }
 
+export interface ChatToneBucket {
+  positive: number;
+  neutral: number;
+  negative: number;
+  averageScore: number | null;
+}
+
+export interface ChatTextStyleSideStats {
+  messageCount: number;
+  avgChars: number | null;
+  medianChars: number | null;
+  p90Chars: number | null;
+  avgWords: number | null;
+  medianWords: number | null;
+  emojiPerMessage: number | null;
+  multiLineRate: number | null;
+  avgLines: number | null;
+  capsRatio: number | null;
+  allCapsRate: number | null;
+  affirmativeRate: number | null;
+  negativeRate: number | null;
+  avgRunLength: number | null;
+  multiMessageRunRate: number | null;
+  tone: ChatToneBucket;
+}
+
+export interface ChatTextStyleSummary {
+  chatId: number;
+  totalMessagesAnalyzed: number;
+  me: ChatTextStyleSideStats;
+  others: ChatTextStyleSideStats;
+}
+
+export interface ChatTextStyleOptions {
+  dateRange?: { start?: Date; end?: Date };
+}
+
 const DAY_BUCKET_EXPR = `date((m.date / @dateScale) + 978307200, 'unixepoch', 'localtime')`;
 const MESSAGE_SECONDS_EXPR = `(m.date / @dateScale) + 978307200`;
+
+const EMOJI_REGEX = /[\p{Extended_Pictographic}]/gu;
+const LETTER_REGEX = /\p{L}/gu;
+const UPPER_LETTER_REGEX = /\p{Lu}/gu;
+const WORD_REGEX = /[\p{L}']+/gu;
+
+const POSITIVE_WORDS = new Set([
+  "love",
+  "loved",
+  "like",
+  "liked",
+  "great",
+  "awesome",
+  "amazing",
+  "good",
+  "nice",
+  "thanks",
+  "thank",
+  "thx",
+  "yay",
+  "lol",
+  "haha",
+  "perfect",
+  "cool",
+  "sweet",
+  "excited",
+  "fun",
+  "beautiful",
+  "wonderful",
+  "best",
+  "congrats",
+  "congratulations",
+  "proud",
+  "happy",
+]);
+
+const NEGATIVE_WORDS = new Set([
+  "hate",
+  "hated",
+  "bad",
+  "terrible",
+  "awful",
+  "sad",
+  "sorry",
+  "angry",
+  "annoyed",
+  "upset",
+  "worst",
+  "sucks",
+  "sucked",
+  "ugh",
+  "wtf",
+  "no",
+  "nope",
+  "nah",
+  "cant",
+  "can't",
+  "cannot",
+  "wont",
+  "won't",
+  "never",
+]);
+
+const POSITIVE_EMOJI_REGEX = /(?:❤️|❤|😍|😊|😄|😁|😂|🤣|🙂|🙌|👍|🎉|😎|🥰|😇|☺️)/gu;
+const NEGATIVE_EMOJI_REGEX = /(?:😢|😭|😡|😠|☹️|🙁|😞|😩|😫|👎|😒|😓|😤|😔)/gu;
+
+const AFFIRMATIVE_PREFIXES = ["sounds good", "sound good", "for sure", "of course"];
+
+const AFFIRMATIVE_WORDS = new Set([
+  "yes",
+  "yeah",
+  "yep",
+  "yup",
+  "ya",
+  "ok",
+  "okay",
+  "k",
+  "kk",
+  "sure",
+  "cool",
+  "great",
+  "awesome",
+  "perfect",
+  "done",
+  "deal",
+  "totally",
+  "absolutely",
+  "definitely",
+]);
+
+const NEGATIVE_FIRST_WORDS = new Set([
+  "no",
+  "nope",
+  "nah",
+  "never",
+  "cant",
+  "can't",
+  "cannot",
+  "wont",
+  "won't",
+]);
+
+function countMatches(pattern: RegExp, text: string): number {
+  pattern.lastIndex = 0;
+  let count = 0;
+  while (pattern.exec(text)) {
+    count += 1;
+  }
+  return count;
+}
+
+function quantile(sorted: number[], q: number): number | null {
+  if (!sorted.length) return null;
+  const clamped = Math.min(1, Math.max(0, q));
+  const pos = (sorted.length - 1) * clamped;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  if (sorted[base] === undefined) return null;
+  const next = sorted[base + 1];
+  if (next === undefined) return sorted[base];
+  return sorted[base] + rest * (next - sorted[base]);
+}
+
+function hasAllCapsWord(text: string): boolean {
+  const parts = text.split(/\s+/);
+  for (const part of parts) {
+    const cleaned = part.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, "");
+    if (cleaned.length < 3) continue;
+    const upper = cleaned.toUpperCase();
+    const lower = cleaned.toLowerCase();
+    if (cleaned === upper && cleaned !== lower) return true;
+  }
+  return false;
+}
+
+function classifyAffirmation(text: string): "affirmative" | "negative" | "neutral" {
+  const normalized = text
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.?!]+$/g, "")
+    .toLowerCase();
+
+  if (!normalized) return "neutral";
+
+  for (const prefix of AFFIRMATIVE_PREFIXES) {
+    if (normalized.startsWith(prefix)) return "affirmative";
+  }
+
+  const firstMatch = normalized.match(WORD_REGEX);
+  const first = firstMatch?.[0] ?? "";
+  if (!first) return "neutral";
+  if (AFFIRMATIVE_WORDS.has(first)) return "affirmative";
+  if (NEGATIVE_FIRST_WORDS.has(first)) return "negative";
+  return "neutral";
+}
+
+function scoreSentiment(text: string): { score: number; bucket: "positive" | "neutral" | "negative" } {
+  let posWords = 0;
+  let negWords = 0;
+  WORD_REGEX.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = WORD_REGEX.exec(text))) {
+    const token = match[0]?.toLowerCase();
+    if (!token) continue;
+    if (POSITIVE_WORDS.has(token)) posWords += 1;
+    if (NEGATIVE_WORDS.has(token)) negWords += 1;
+  }
+
+  const posEmoji = countMatches(POSITIVE_EMOJI_REGEX, text);
+  const negEmoji = countMatches(NEGATIVE_EMOJI_REGEX, text);
+
+  const score = posWords + posEmoji - negWords - negEmoji;
+  const bucket = score > 0 ? "positive" : score < 0 ? "negative" : "neutral";
+  return { score, bucket };
+}
+
+function normalizeAnalyzedText(text: string): string | null {
+  const cleaned = text
+    .replace(/\u0000/g, "")
+    .replace(/\uFFFC/g, "")
+    .replace(/\u2028/g, "\n")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function extractTextFromAttributedBody(blob: Buffer): string | null {
+  if (!blob || blob.length === 0) return null;
+
+  try {
+    const unarchiver = Unarchiver.open(blob, Unarchiver.BinaryDecoding.none);
+    const decoded = unarchiver.decodeAll();
+
+    const stack: unknown[] = [decoded];
+    let best: string | null = null;
+
+    while (stack.length > 0) {
+      const value = stack.pop();
+      if (!value) continue;
+
+      if (typeof value === "string") {
+        const normalized = normalizeAnalyzedText(value);
+        if (normalized && (!best || normalized.length > best.length)) {
+          best = normalized;
+        }
+        continue;
+      }
+
+      if (Array.isArray(value)) {
+        stack.push(...value);
+        continue;
+      }
+
+      if (typeof value !== "object") {
+        continue;
+      }
+
+      const asRecord = value as Record<string, unknown>;
+      const directString = asRecord.string;
+      if (typeof directString === "string") {
+        const normalized = normalizeAnalyzedText(directString);
+        if (normalized && (!best || normalized.length > best.length)) {
+          best = normalized;
+        }
+      }
+
+      const maybeValues = asRecord.values;
+      if (Array.isArray(maybeValues)) {
+        stack.push(...maybeValues);
+      }
+
+      const maybeContents = asRecord.contents;
+      if (Array.isArray(maybeContents)) {
+        stack.push(...maybeContents);
+      } else if (maybeContents instanceof Map) {
+        stack.push(...maybeContents.keys(), ...maybeContents.values());
+      }
+
+      const maybeElements = asRecord.elements;
+      if (Array.isArray(maybeElements)) {
+        stack.push(...maybeElements);
+      }
+    }
+
+    return best;
+  } catch {
+    // Some attributedBody values can be corrupt/unsupported; ignore them for analytics.
+    return null;
+  }
+}
 
 function chooseTimelineBucket(options: { bucket?: PersonTimelineBucket; start?: Date; end?: Date }): PersonTimelineBucket {
   if (options.bucket) return options.bucket;
@@ -2520,5 +2826,287 @@ export function getChatSummaryById(chatId: number, options: ChatSummaryOptions =
     reactions: reactionTotals,
     reactionParticipants,
     messageParticipants,
+  };
+}
+
+type ChatTextSideKey = "me" | "others";
+
+type MutableTone = {
+  positive: number;
+  neutral: number;
+  negative: number;
+  totalScore: number;
+};
+
+type MutableTextSide = {
+  messageCount: number;
+  totalChars: number;
+  charLengths: number[];
+  totalWords: number;
+  wordCounts: number[];
+  totalEmojis: number;
+  multiLineCount: number;
+  totalLines: number;
+  upperLetters: number;
+  letters: number;
+  allCapsMessages: number;
+  affirmativeCount: number;
+  negativeCount: number;
+  runLengths: number[];
+  tone: MutableTone;
+};
+
+function createEmptyTone(): MutableTone {
+  return { positive: 0, neutral: 0, negative: 0, totalScore: 0 };
+}
+
+function createEmptyTextSide(): MutableTextSide {
+  return {
+    messageCount: 0,
+    totalChars: 0,
+    charLengths: [],
+    totalWords: 0,
+    wordCounts: [],
+    totalEmojis: 0,
+    multiLineCount: 0,
+    totalLines: 0,
+    upperLetters: 0,
+    letters: 0,
+    allCapsMessages: 0,
+    affirmativeCount: 0,
+    negativeCount: 0,
+    runLengths: [],
+    tone: createEmptyTone(),
+  };
+}
+
+function finalizeTextSide(side: MutableTextSide): ChatTextStyleSideStats {
+  const messageCount = side.messageCount;
+  if (messageCount <= 0) {
+    return {
+      messageCount: 0,
+      avgChars: null,
+      medianChars: null,
+      p90Chars: null,
+      avgWords: null,
+      medianWords: null,
+      emojiPerMessage: null,
+      multiLineRate: null,
+      avgLines: null,
+      capsRatio: null,
+      allCapsRate: null,
+      affirmativeRate: null,
+      negativeRate: null,
+      avgRunLength: null,
+      multiMessageRunRate: null,
+      tone: {
+        positive: 0,
+        neutral: 0,
+        negative: 0,
+        averageScore: null,
+      },
+    };
+  }
+
+  side.charLengths.sort((a, b) => a - b);
+  side.wordCounts.sort((a, b) => a - b);
+  side.runLengths.sort((a, b) => a - b);
+
+  const avgChars = side.totalChars / messageCount;
+  const medianChars = quantile(side.charLengths, 0.5);
+  const p90Chars = quantile(side.charLengths, 0.9);
+  const avgWords = side.totalWords / messageCount;
+  const medianWords = quantile(side.wordCounts, 0.5);
+  const emojiPerMessage = side.totalEmojis / messageCount;
+  const multiLineRate = side.multiLineCount / messageCount;
+  const avgLines = side.totalLines / messageCount;
+  const capsRatio = side.letters > 0 ? side.upperLetters / side.letters : null;
+  const allCapsRate = side.allCapsMessages / messageCount;
+  const affirmativeRate = side.affirmativeCount / messageCount;
+  const negativeRate = side.negativeCount / messageCount;
+
+  const runCount = side.runLengths.length;
+  const avgRunLength =
+    runCount > 0 ? side.runLengths.reduce((sum, value) => sum + value, 0) / runCount : null;
+  const multiMessageRunRate =
+    runCount > 0 ? side.runLengths.filter((value) => value >= 2).length / runCount : null;
+
+  const averageScore = side.tone.totalScore / messageCount;
+
+  return {
+    messageCount,
+    avgChars,
+    medianChars,
+    p90Chars,
+    avgWords,
+    medianWords,
+    emojiPerMessage,
+    multiLineRate,
+    avgLines,
+    capsRatio,
+    allCapsRate,
+    affirmativeRate,
+    negativeRate,
+    avgRunLength,
+    multiMessageRunRate,
+    tone: {
+      positive: side.tone.positive,
+      neutral: side.tone.neutral,
+      negative: side.tone.negative,
+      averageScore,
+    },
+  };
+}
+
+export function getChatTextStyleSummary(
+  chatId: number,
+  options: ChatTextStyleOptions = {},
+): ChatTextStyleSummary | null {
+  if (!Number.isInteger(chatId) || chatId <= 0) {
+    return null;
+  }
+
+  const db = getDatabase();
+  const dateScale = detectMessageDateScale(db);
+  const hasDeletionFlag = detectMessageDeletionColumn(db);
+  const reactionColumnSupport = detectReactionColumns(db);
+  const reactionsSupported = reactionColumnSupport.hasAssociatedGuid && reactionColumnSupport.hasAssociatedType;
+  const attributedBodySupported = detectAttributedBodySupport(db);
+
+  const params: Record<string, unknown> = {
+    chatId,
+    dateScale,
+  };
+
+  const whereClauses: string[] = ["cmj.chat_id = @chatId", "m.date IS NOT NULL"];
+
+  if (attributedBodySupported) {
+    whereClauses.push("((m.text IS NOT NULL AND length(trim(m.text)) > 0) OR m.attributedBody IS NOT NULL)");
+  } else {
+    whereClauses.push("m.text IS NOT NULL", "length(trim(m.text)) > 0");
+  }
+
+  if (hasDeletionFlag) {
+    whereClauses.push("m.is_deleted = 0");
+  }
+
+  if (reactionsSupported) {
+    whereClauses.push("(m.associated_message_guid IS NULL OR ABS(m.associated_message_type) NOT BETWEEN 2000 AND 2005)");
+  }
+
+  const start = options.dateRange?.start;
+  const end = options.dateRange?.end;
+  if (start) {
+    params.startSeconds = Math.floor(start.getTime() / 1000);
+    whereClauses.push("m.date >= ((@startSeconds - 978307200) * @dateScale)");
+  }
+  if (end) {
+    params.endSeconds = Math.ceil(end.getTime() / 1000);
+    whereClauses.push("m.date <= ((@endSeconds - 978307200) * @dateScale)");
+  }
+
+  const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
+  const attributedBodySelect = attributedBodySupported ? "m.attributedBody AS attributedBody" : "NULL AS attributedBody";
+
+  const sql = `
+    SELECT
+      m.ROWID AS messageId,
+      m.is_from_me AS isFromMe,
+      m.text AS text,
+      ${attributedBodySelect},
+      ${MESSAGE_SECONDS_EXPR} AS messageSeconds
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    ${whereSql}
+    ORDER BY messageSeconds ASC, m.ROWID ASC
+  `;
+
+  const stmt = db.prepare(sql);
+  const iterator = stmt.iterate(params) as IterableIterator<{
+    messageId: number;
+    isFromMe: number;
+    text: string | null;
+    attributedBody: Buffer | null;
+    messageSeconds: number | null;
+  }>;
+
+  const bySide: Record<ChatTextSideKey, MutableTextSide> = {
+    me: createEmptyTextSide(),
+    others: createEmptyTextSide(),
+  };
+
+  let currentRunSide: ChatTextSideKey | null = null;
+  let currentRunLength = 0;
+  const flushRun = () => {
+    if (!currentRunSide) return;
+    bySide[currentRunSide].runLengths.push(currentRunLength);
+  };
+
+  for (const row of iterator) {
+    const rawText = typeof row.text === "string" ? row.text : "";
+    let text = normalizeAnalyzedText(rawText);
+
+    if (!text && row.attributedBody instanceof Buffer) {
+      text = extractTextFromAttributedBody(row.attributedBody);
+    }
+
+    if (!text) continue;
+
+    const sideKey: ChatTextSideKey = row.isFromMe === 1 ? "me" : "others";
+    const side = bySide[sideKey];
+
+    if (currentRunSide === null) {
+      currentRunSide = sideKey;
+      currentRunLength = 1;
+    } else if (currentRunSide === sideKey) {
+      currentRunLength += 1;
+    } else {
+      flushRun();
+      currentRunSide = sideKey;
+      currentRunLength = 1;
+    }
+
+    side.messageCount += 1;
+
+    const chars = text.length;
+    side.totalChars += chars;
+    side.charLengths.push(chars);
+
+    const words = text.split(/\s+/).filter(Boolean).length;
+    side.totalWords += words;
+    side.wordCounts.push(words);
+
+    const lineCount = text.split(/\r\n|\r|\n/).length;
+    side.totalLines += lineCount;
+    if (lineCount > 1) side.multiLineCount += 1;
+
+    side.totalEmojis += countMatches(EMOJI_REGEX, text);
+    side.letters += countMatches(LETTER_REGEX, text);
+    side.upperLetters += countMatches(UPPER_LETTER_REGEX, text);
+
+    if (hasAllCapsWord(text)) side.allCapsMessages += 1;
+
+    const affirmation = classifyAffirmation(text);
+    if (affirmation === "affirmative") side.affirmativeCount += 1;
+    if (affirmation === "negative") side.negativeCount += 1;
+
+    const tone = scoreSentiment(text);
+    side.tone.totalScore += tone.score;
+    if (tone.bucket === "positive") side.tone.positive += 1;
+    else if (tone.bucket === "negative") side.tone.negative += 1;
+    else side.tone.neutral += 1;
+  }
+
+  flushRun();
+
+  const meStats = finalizeTextSide(bySide.me);
+  const otherStats = finalizeTextSide(bySide.others);
+  const totalMessagesAnalyzed = meStats.messageCount + otherStats.messageCount;
+
+  return {
+    chatId,
+    totalMessagesAnalyzed,
+    me: meStats,
+    others: otherStats,
   };
 }

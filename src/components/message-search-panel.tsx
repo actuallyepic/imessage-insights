@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import type { MessageSearchMode, SerializableChatSummary } from "@/lib/imessage/types";
@@ -78,14 +78,36 @@ export function MessageSearchPanel({
   const [includeReceived, setIncludeReceived] = useState(true);
   const [rangeMode, setRangeMode] = useState<SearchRangeMode>("view");
   const [chatId, setChatId] = useState<string>("");
-  const [page, setPage] = useState(0);
 
   const debouncedQuery = useDebouncedValue(query, 350);
   const debouncedSender = useDebouncedValue(sender, 350);
 
-  useEffect(() => {
-    setPage(0);
-  }, [debouncedQuery, debouncedSender, mode, includeSent, includeReceived, rangeMode, chatId]);
+  const pageKey = useMemo(() => {
+    return JSON.stringify({
+      q: debouncedQuery,
+      s: debouncedSender,
+      mode,
+      sent: includeSent,
+      received: includeReceived,
+      range: rangeMode,
+      chat: chatId,
+    });
+  }, [chatId, debouncedQuery, debouncedSender, includeReceived, includeSent, mode, rangeMode]);
+
+  const [pageByKey, setPageByKey] = useState<Record<string, number>>({});
+  const page = pageByKey[pageKey] ?? 0;
+
+  const setPage = useCallback(
+    (updater: number | ((value: number) => number)) => {
+      setPageByKey((current) => {
+        const existing = current[pageKey] ?? 0;
+        const next = typeof updater === "function" ? updater(existing) : updater;
+        if (next === existing) return current;
+        return { ...current, [pageKey]: next };
+      });
+    },
+    [pageKey],
+  );
 
   const chatOptions = useMemo(() => {
     const options = topChats

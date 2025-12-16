@@ -5,15 +5,10 @@ import { getPersonMessageTimeline } from "@/lib/imessage/queries";
 
 const timelineSchema = z.object({
   key: z.string().min(1, "key is required"),
-  bucket: z
-    .string()
-    .optional()
-    .transform((value) => (value ? value.toLowerCase() : undefined))
-    .refine(
-      (value) => value === undefined || (["hour", "day", "week", "month"] as const).includes(value as any),
-      "bucket must be hour, day, week, or month",
-    )
-    .transform((value) => value as "hour" | "day" | "week" | "month" | undefined),
+  bucket: z.preprocess(
+    (value) => (typeof value === "string" ? value.toLowerCase() : undefined),
+    z.enum(["hour", "day", "week", "month"]).optional(),
+  ),
   start: z
     .string()
     .optional()
@@ -69,4 +64,3 @@ export async function GET(request: Request) {
     return handleDbError(error);
   }
 }
-

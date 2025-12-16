@@ -805,15 +805,33 @@ export function PersonDrawer({
       if (rangeStartIso) params.set("start", rangeStartIso);
       if (rangeEndIso) params.set("end", rangeEndIso);
       const response = await fetch(`/api/person-timeline?${params.toString()}`);
-      const payload = (await response.json().catch(() => null)) as any;
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            data?: PersonMessageTimeline;
+            error?: unknown;
+          }
+        | null;
 
       if (!response.ok) {
-        const direct = typeof payload?.error === "string" ? payload.error : null;
-        const flattened = payload?.error?.formErrors?.[0];
-        const fieldErrors = payload?.error?.fieldErrors;
+        const errorPayload = payload?.error;
+        const direct = typeof errorPayload === "string" ? errorPayload : null;
+
+        const formErrors =
+          errorPayload && typeof errorPayload === "object" && "formErrors" in errorPayload
+            ? (errorPayload as { formErrors?: unknown }).formErrors
+            : null;
+        const flattened =
+          Array.isArray(formErrors) && typeof formErrors[0] === "string" ? formErrors[0] : null;
+
+        const fieldErrors =
+          errorPayload && typeof errorPayload === "object" && "fieldErrors" in errorPayload
+            ? (errorPayload as { fieldErrors?: unknown }).fieldErrors
+            : null;
         const firstFieldError =
           fieldErrors && typeof fieldErrors === "object"
-            ? Object.values(fieldErrors).flat().find((value: unknown) => typeof value === "string")
+            ? Object.values(fieldErrors as Record<string, unknown>)
+                .flat()
+                .find((value: unknown) => typeof value === "string")
             : null;
         const message =
           direct ||

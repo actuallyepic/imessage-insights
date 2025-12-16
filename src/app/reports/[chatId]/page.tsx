@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ShareReportButton } from "@/components/share-report-button";
-import { getChatSummaryById } from "@/lib/imessage/queries";
+import { getChatSummaryById, getChatTextStyleSummary, type ChatTextStyleSideStats } from "@/lib/imessage/queries";
 import { REACTION_TYPES } from "@/lib/imessage/types";
 
 export const runtime = "nodejs";
@@ -41,6 +41,94 @@ function formatCompact(value: number) {
 function formatPercent(part: number, total: number) {
   if (!total || !Number.isFinite(part)) return "—";
   return `${((part / total) * 100).toFixed(1)}%`;
+}
+
+function formatRate(value: number | null | undefined, digits = 0) {
+  if (!Number.isFinite(value ?? NaN)) return "—";
+  const percent = (value as number) * 100;
+  return `${percent.toFixed(digits)}%`;
+}
+
+function formatMetric(value: number | null | undefined, digits = 1) {
+  if (!Number.isFinite(value ?? NaN)) return "—";
+  const numeric = value as number;
+  return digits === 0 ? Math.round(numeric).toString() : numeric.toFixed(digits);
+}
+
+function ToneBar({ stats }: { stats: ChatTextStyleSideStats }) {
+  const total = stats.tone.positive + stats.tone.neutral + stats.tone.negative;
+  if (!total) {
+    return <p className="mt-2 text-xs text-neutral-500">No tone sample.</p>;
+  }
+
+  const positiveRate = stats.tone.positive / total;
+  const neutralRate = stats.tone.neutral / total;
+  const negativeRate = stats.tone.negative / total;
+
+  return (
+    <div className="mt-2">
+      <div className="flex h-2 overflow-hidden rounded-full bg-neutral-800/70">
+        <div className="h-full bg-emerald-400/80" style={{ width: `${positiveRate * 100}%` }} />
+        <div className="h-full bg-neutral-500/70" style={{ width: `${neutralRate * 100}%` }} />
+        <div className="h-full bg-rose-400/80" style={{ width: `${negativeRate * 100}%` }} />
+      </div>
+      <div className="mt-2 flex flex-wrap justify-between gap-2 text-[11px] text-neutral-400">
+        <span>
+          + {formatRate(positiveRate)} · ○ {formatRate(neutralRate)} · − {formatRate(negativeRate)}
+        </span>
+        <span className="text-neutral-500">avg {formatMetric(stats.tone.averageScore, 2)}</span>
+      </div>
+    </div>
+  );
+}
+
+function StyleCard({ title, stats }: { title: string; stats: ChatTextStyleSideStats }) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-neutral-950/20 p-5">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="text-sm font-semibold text-neutral-100">{title}</p>
+        <span className="text-xs text-neutral-500">{formatNumber(stats.messageCount)} msgs</span>
+      </div>
+
+      <div className="mt-4 grid gap-3 text-sm text-neutral-200">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-neutral-400">Median length</span>
+          <span className="font-semibold text-white">
+            {stats.medianChars ? `${formatMetric(stats.medianChars, 0)} chars` : "—"}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-neutral-400">P90 length</span>
+          <span className="font-semibold text-white">
+            {stats.p90Chars ? `${formatMetric(stats.p90Chars, 0)} chars` : "—"}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-neutral-400">Emoji density</span>
+          <span className="font-semibold text-white">{formatMetric(stats.emojiPerMessage, 2)} / msg</span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-neutral-400">Multi-line</span>
+          <span className="font-semibold text-white">{formatRate(stats.multiLineRate)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-neutral-400">Split-up streaks</span>
+          <span className="font-semibold text-white">
+            {formatMetric(stats.avgRunLength, 2)} avg · {formatRate(stats.multiMessageRunRate)}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-neutral-400">Affirmative starts</span>
+          <span className="font-semibold text-white">{formatRate(stats.affirmativeRate)}</span>
+        </div>
+      </div>
+
+      <div className="mt-5 border-t border-white/10 pt-4">
+        <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Tone</p>
+        <ToneBar stats={stats} />
+      </div>
+    </div>
+  );
 }
 
 function formatDateTime(value: Date | null) {
@@ -90,6 +178,9 @@ export default async function ReportPage({ params, searchParams }: ReportPagePro
   const start = parseDateParam(queryParams.start);
   const end = parseDateParam(queryParams.end);
   const summary = getChatSummaryById(chatId, {
+    dateRange: { start, end },
+  });
+  const style = getChatTextStyleSummary(chatId, {
     dateRange: { start, end },
   });
 
@@ -223,6 +314,23 @@ export default async function ReportPage({ params, searchParams }: ReportPagePro
             );
           })}
         </section>
+
+        {style && style.totalMessagesAnalyzed > 0 && (
+          <section className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Tone &amp; style</p>
+                <p className="mt-1 text-sm text-neutral-400">
+                  Based on {formatNumber(style.totalMessagesAnalyzed)} text messages in this chat.
+                </p>
+              </div>
+            </div>
+            <div className="mt-5 grid gap-4 lg:grid-cols-2">
+              <StyleCard title="You" stats={style.me} />
+              <StyleCard title="Others" stats={style.others} />
+            </div>
+          </section>
+        )}
 
         <section className="grid gap-6 lg:grid-cols-2">
           <div className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5">

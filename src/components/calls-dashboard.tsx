@@ -1,7 +1,7 @@
 'use client';
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { GlobalRangeBar } from "@/components/global-range-bar";
@@ -182,8 +182,33 @@ export default function CallsDashboard() {
   const [direction, setDirection] = useState<"all" | CallDirection>("all");
   const [answeredFilter, setAnsweredFilter] = useState<AnsweredFilter>("all");
   const [rankingMode, setRankingMode] = useState<RankingMode>("duration");
-  const [recentLimit, setRecentLimit] = useState(50);
   const [selectedPersonKey, setSelectedPersonKey] = useState<string | null>(null);
+
+  const recentLimitKey = useMemo(() => {
+    return JSON.stringify({
+      provider,
+      media,
+      direction,
+      answered: answeredFilter,
+      start: range.startIso,
+      end: range.endIso,
+    });
+  }, [answeredFilter, direction, media, provider, range.endIso, range.startIso]);
+
+  const [recentLimitByKey, setRecentLimitByKey] = useState<Record<string, number>>({});
+  const recentLimit = recentLimitByKey[recentLimitKey] ?? 50;
+
+  const setRecentLimit = useCallback(
+    (updater: number | ((value: number) => number)) => {
+      setRecentLimitByKey((current) => {
+        const existing = current[recentLimitKey] ?? 50;
+        const next = typeof updater === "function" ? updater(existing) : updater;
+        if (next === existing) return current;
+        return { ...current, [recentLimitKey]: next };
+      });
+    },
+    [recentLimitKey],
+  );
 
   const callsQuery = useQuery({
     queryKey: ["calls", "all"],
@@ -219,10 +244,6 @@ export default function CallsDashboard() {
     enabled: Boolean(selectedPersonKey),
   });
   const messagesStats = (messagesQuery.data as ConversationStats | undefined) ?? null;
-
-  useEffect(() => {
-    setRecentLimit(50);
-  }, [answeredFilter, direction, media, provider, range.endIso, range.startIso]);
 
   const rangeBounds = useMemo(() => {
     return { start: range.startDate, end: range.endDate };
