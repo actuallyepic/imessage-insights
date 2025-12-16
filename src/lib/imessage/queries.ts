@@ -1,4 +1,5 @@
 import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3";
+import { afinn165 } from "afinn-165";
 import { Unarchiver } from "node-typedstream";
 import {
   getContactInfoForHandle,
@@ -603,65 +604,94 @@ const LETTER_REGEX = /\p{L}/gu;
 const UPPER_LETTER_REGEX = /\p{Lu}/gu;
 const WORD_REGEX = /[\p{L}']+/gu;
 
-const POSITIVE_WORDS = new Set([
-  "love",
-  "loved",
-  "like",
-  "liked",
-  "great",
-  "awesome",
-  "amazing",
-  "good",
-  "nice",
-  "thanks",
-  "thank",
-  "thx",
-  "yay",
-  "lol",
-  "haha",
-  "perfect",
-  "cool",
-  "sweet",
-  "excited",
-  "fun",
-  "beautiful",
-  "wonderful",
-  "best",
-  "congrats",
-  "congratulations",
-  "proud",
-  "happy",
+const AFINN_SCORES: Record<string, number> = afinn165;
+
+const POSITIVE_EMOJI_REGEX =
+  /(?:❤️|❤|🧡|💛|💚|💙|💜|🤍|🩷|🩵|🖤|🤎|💖|💕|💞|💓|💗|💘|💝|😘|😗|😙|😚|😍|🥰|😊|😄|😁|😆|😂|🤣|🙂|😉|😎|🤩|🥳|🎉|🙌|👏|👍|👌|🤝|🫶|🙏|💯|✨|🔥)/gu;
+const NEGATIVE_EMOJI_REGEX =
+  /(?:😢|😭|😿|😞|😔|😟|🙁|☹️|😣|😖|😫|😩|😤|😠|😡|🤬|😒|😑|😕|😬|😓|😥|😰|😨|😱|👎|💔|🖕)/gu;
+
+const POSITIVE_EMOTICON_REGEX =
+  /(?:<3|:\)|:-\)|:D|:-D|;\)|;-\)|:P|:-P|=D|xD|\^_\^|:3|:o\)|:-o\))/g;
+const NEGATIVE_EMOTICON_REGEX =
+  /(?::\(|:-\(|:'\(|D:|>:\(|>:\[|T_T|;-;|:\||:-\||:\/|:-\/|:\\|:-\\)/g;
+
+const EXTRA_SENTIMENT_SCORES = new Map<string, number>([
+  // laughter / playful
+  ["lol", 2],
+  ["lmao", 3],
+  ["lmfao", 3],
+  ["rofl", 3],
+  ["roflmao", 4],
+  ["lolol", 2],
+  ["hehe", 2],
+  ["haha", 2],
+  ["ahaha", 2],
+  ["bahaha", 2],
+  ["bwahaha", 2],
+  ["hahaha", 2],
+  ["hehehe", 2],
+
+  // gratitude / affection shorthand
+  ["ty", 2],
+  ["thx", 2],
+  ["tysm", 3],
+  ["ily", 4],
+  ["ilysm", 5],
+  ["xoxo", 4],
+  ["mwah", 3],
+  ["luv", 2],
+
+  // hype / approval slang
+  ["yay", 2],
+  ["yayy", 2],
+  ["yaaay", 2],
+  ["yesss", 2],
+  ["yessir", 2],
+  ["yessirrr", 2],
+  ["yass", 3],
+  ["yaaas", 3],
+  ["slay", 3],
+  ["lit", 3],
+  ["dope", 3],
+  ["fire", 3],
+  ["goated", 4],
+  ["based", 2],
+  ["gg", 1],
+
+  // negative / frustration slang
+  ["smh", -2],
+  ["fml", -4],
+  ["wtf", -4],
+  ["wth", -3],
+  ["ugh", -2],
+  ["meh", -1],
+  ["bruh", -1],
+  ["rip", -2],
+  ["yikes", -2],
+  ["oof", -1],
+  ["facepalm", -2],
+  ["idc", -1],
+  ["stfu", -4],
+  ["gtfo", -3],
+  ["kms", -4],
 ]);
 
-const NEGATIVE_WORDS = new Set([
-  "hate",
-  "hated",
-  "bad",
-  "terrible",
-  "awful",
-  "sad",
-  "sorry",
-  "angry",
-  "annoyed",
-  "upset",
-  "worst",
-  "sucks",
-  "sucked",
-  "ugh",
-  "wtf",
-  "no",
-  "nope",
-  "nah",
-  "cant",
-  "can't",
-  "cannot",
-  "wont",
-  "won't",
-  "never",
-]);
+const POSITIVE_TOKEN_REGEXES: Array<{ pattern: RegExp; score: number }> = [
+  { pattern: /^(?:ha){2,}$/i, score: 2 }, // hahaha, hahahaha
+  { pattern: /^(?:he){2,}$/i, score: 2 }, // hehe, hehehe
+  { pattern: /^l+o+l+$/i, score: 2 }, // lol, lool, loool
+  { pattern: /^l+m+a+o+$/i, score: 3 }, // lmao variants
+  { pattern: /^r+o+f+l+$/i, score: 3 }, // rofl variants
+  { pattern: /^aw+w+$/i, score: 1 }, // awwww
+  { pattern: /^ya+y+$/i, score: 1 }, // yaaay
+];
 
-const POSITIVE_EMOJI_REGEX = /(?:❤️|❤|😍|😊|😄|😁|😂|🤣|🙂|🙌|👍|🎉|😎|🥰|😇|☺️)/gu;
-const NEGATIVE_EMOJI_REGEX = /(?:😢|😭|😡|😠|☹️|🙁|😞|😩|😫|👎|😒|😓|😤|😔)/gu;
+const NEGATIVE_TOKEN_REGEXES: Array<{ pattern: RegExp; score: number }> = [
+  { pattern: /^ug+h+$/i, score: -2 }, // ughhh
+  { pattern: /^gr+r+$/i, score: -1 }, // grrr
+  { pattern: /^ar+g+h+$/i, score: -1 }, // arghhh
+];
 
 const AFFIRMATIVE_PREFIXES = ["sounds good", "sound good", "for sure", "of course"];
 
@@ -753,22 +783,99 @@ function classifyAffirmation(text: string): "affirmative" | "negative" | "neutra
   return "neutral";
 }
 
+const TOKEN_SENTIMENT_CACHE = new Map<string, number>();
+
+function generateTokenCandidates(token: string): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (value: string | null | undefined) => {
+    if (!value) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    candidates.push(value);
+  };
+
+  const base = token.toLowerCase();
+  add(base);
+
+  const noApostrophes = base.includes("'") ? base.replace(/'/g, "") : null;
+  add(noApostrophes);
+
+  if (base.endsWith("in'") && base.length > 3) {
+    add(`${base.slice(0, -1)}g`);
+  }
+  if (noApostrophes && noApostrophes.endsWith("in") && noApostrophes.length > 3) {
+    add(`${noApostrophes}g`);
+  }
+
+  const addRepeatCollapsed = (value: string | null) => {
+    if (!value) return;
+    if (!/(.)\1{2,}/u.test(value)) return;
+    add(value.replace(/(.)\1{2,}/gu, "$1"));
+    add(value.replace(/(.)\1{2,}/gu, "$1$1"));
+  };
+
+  addRepeatCollapsed(base);
+  addRepeatCollapsed(noApostrophes);
+
+  return candidates;
+}
+
+function scoreTokenSentiment(token: string): number {
+  const cacheKey = token.toLowerCase();
+  const cached = TOKEN_SENTIMENT_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  let best = 0;
+  const candidates = generateTokenCandidates(cacheKey);
+
+  for (const candidate of candidates) {
+    const afinn = AFINN_SCORES[candidate];
+    if (typeof afinn === "number" && Number.isFinite(afinn) && Math.abs(afinn) > Math.abs(best)) {
+      best = afinn;
+    }
+
+    const extra = EXTRA_SENTIMENT_SCORES.get(candidate);
+    if (extra !== undefined && Number.isFinite(extra) && Math.abs(extra) > Math.abs(best)) {
+      best = extra;
+    }
+  }
+
+  if (best === 0) {
+    for (const { pattern, score } of POSITIVE_TOKEN_REGEXES) {
+      if (pattern.test(cacheKey) && Math.abs(score) > Math.abs(best)) {
+        best = score;
+      }
+    }
+
+    for (const { pattern, score } of NEGATIVE_TOKEN_REGEXES) {
+      if (pattern.test(cacheKey) && Math.abs(score) > Math.abs(best)) {
+        best = score;
+      }
+    }
+  }
+
+  TOKEN_SENTIMENT_CACHE.set(cacheKey, best);
+  return best;
+}
+
 function scoreSentiment(text: string): { score: number; bucket: "positive" | "neutral" | "negative" } {
-  let posWords = 0;
-  let negWords = 0;
+  let score = 0;
+
   WORD_REGEX.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = WORD_REGEX.exec(text))) {
-    const token = match[0]?.toLowerCase();
+    const token = match[0];
     if (!token) continue;
-    if (POSITIVE_WORDS.has(token)) posWords += 1;
-    if (NEGATIVE_WORDS.has(token)) negWords += 1;
+    score += scoreTokenSentiment(token);
   }
 
-  const posEmoji = countMatches(POSITIVE_EMOJI_REGEX, text);
-  const negEmoji = countMatches(NEGATIVE_EMOJI_REGEX, text);
+  score += countMatches(POSITIVE_EMOJI_REGEX, text);
+  score -= countMatches(NEGATIVE_EMOJI_REGEX, text);
+  score += countMatches(POSITIVE_EMOTICON_REGEX, text);
+  score -= countMatches(NEGATIVE_EMOTICON_REGEX, text);
 
-  const score = posWords + posEmoji - negWords - negEmoji;
   const bucket = score > 0 ? "positive" : score < 0 ? "negative" : "neutral";
   return { score, bucket };
 }
