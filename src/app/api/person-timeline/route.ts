@@ -9,6 +9,18 @@ const timelineSchema = z.object({
     (value) => (typeof value === "string" ? value.toLowerCase() : undefined),
     z.enum(["hour", "day", "week", "month"]).optional(),
   ),
+  chatIds: z.preprocess(
+    (value) => {
+      if (typeof value !== "string") return undefined;
+      const entries = value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      if (entries.length === 0) return undefined;
+      return entries.map((entry) => Number(entry));
+    },
+    z.array(z.number().int().positive()).optional(),
+  ),
   start: z
     .string()
     .optional()
@@ -47,12 +59,13 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
   }
 
-  const { key, bucket, start, end } = parsed.data;
+  const { key, bucket, start, end, chatIds } = parsed.data;
 
   try {
     const timeline = getPersonMessageTimeline({
       personKey: key,
       bucket,
+      chatIds,
       dateRange: {
         start,
         end,

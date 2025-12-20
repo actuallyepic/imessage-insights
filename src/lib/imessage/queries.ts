@@ -548,6 +548,7 @@ export interface PersonMessageTimelineOptions {
   personKey: string;
   bucket?: PersonTimelineBucket;
   dateRange?: { start?: Date; end?: Date };
+  chatIds?: number[];
 }
 
 export interface StatsOptions {
@@ -1028,6 +1029,15 @@ export function getPersonMessageTimeline(options: PersonMessageTimelineOptions):
   if (end) {
     params.endSeconds = Math.ceil(end.getTime() / 1000);
     whereClauses.push("m.date <= ((@endSeconds - 978307200) * @dateScale)");
+  }
+
+  const chatIds = (options.chatIds ?? []).filter((chatId) => Number.isFinite(chatId) && chatId > 0);
+  if (chatIds.length > 0) {
+    chatIds.forEach((chatId, index) => {
+      params[`chat${index}`] = chatId;
+    });
+    const chatPlaceholders = chatIds.map((_, index) => `@chat${index}`).join(", ");
+    whereClauses.push(`rc.chatId IN (${chatPlaceholders})`);
   }
 
   const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
