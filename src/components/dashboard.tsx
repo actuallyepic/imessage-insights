@@ -1,9 +1,15 @@
 'use client';
 
+import Link from "next/link";
 import { TRPCClientError } from "@trpc/client";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
 
-import { CONVERSATION_GAP_SECONDS, GHOST_RESPONSE_THRESHOLD_SECONDS } from "@/lib/imessage/constants";
+import { GlobalRangeBar } from "@/components/global-range-bar";
+import { PersonDrawer, type PersonCallStats, type PersonMessageStats, type PersonMessageThread, type PersonRecentCall } from "@/components/person-drawer";
+import { MessageSearchPanel } from "@/components/message-search-panel";
+import { useGlobalRange } from "@/hooks/use-global-range";
+import { REPLY_WINDOW_SECONDS, SESSION_GAP_SECONDS } from "@/lib/imessage/constants";
 import type {
   HourlyCount,
   ReactionCountSummary,
@@ -13,15 +19,28 @@ import type {
   WeekdayCount,
 } from "@/lib/imessage/types";
 import { useStatsSummary } from "@/hooks/use-stats-summary";
+import { fetchAllCalls, type CallApiRecord } from "@/lib/callhistory/client";
 import type { AppRouter } from "@/server/app-router";
-
-type StatsRange = "1h" | "6h" | "12h" | "1d" | "3d" | "5d" | "7d" | "30d" | "90d" | "all";
 
 function formatDateTime(value: string | null) {
   if (!value) return "Unknown";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Unknown";
   return date.toLocaleString();
+}
+
+function parseDateTime(value: string | null | undefined) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function getCallParticipants(call: CallApiRecord) {
+  if (call.participants.length > 0) return call.participants;
+  if (call.address) {
+    return [{ id: call.address, handle: call.address, displayName: call.name }];
+  }
+  return [];
 }
 
 function formatParticipants(chat: ChatSummary) {
@@ -82,10 +101,11 @@ function computeTotals(stats: ConversationStats | null) {
 }
 
 function getStatsQueryError(error: unknown) {
-  if (error instanceof TRPCClientError<AppRouter>) {
+  if (error instanceof TRPCClientError) {
+    const trpcError = error as TRPCClientError<AppRouter>;
     return {
-      message: error.message,
-      httpStatus: error.data?.httpStatus,
+      message: trpcError.message,
+      httpStatus: trpcError.data?.httpStatus,
     };
   }
   if (error instanceof Error) {
@@ -97,28 +117,14 @@ function getStatsQueryError(error: unknown) {
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
-const rangeDurations: Record<Exclude<StatsRange, "all">, number> = {
-  "1h": 1 * HOUR_MS,
-  "6h": 6 * HOUR_MS,
-  "12h": 12 * HOUR_MS,
-  "1d": 1 * DAY_MS,
-  "3d": 3 * DAY_MS,
-  "5d": 5 * DAY_MS,
-  "7d": 7 * DAY_MS,
-  "30d": 30 * DAY_MS,
-  "90d": 90 * DAY_MS,
-};
-
-const statsRangeOptions: StatsRange[] = ["1h", "6h", "12h", "1d", "3d", "5d", "7d", "30d", "90d", "all"];
-const singleDayRangeOptions: StatsRange[] = ["1h", "6h", "12h", "1d"];
 const DEFAULT_STATS_LIMIT = 40;
 const CHAT_COUNT_OPTIONS = [5, 10, 20, 30];
 const ACCESS_TIP_STORAGE_KEY = "imessage-insights:fda-tip-dismissed";
-const STATS_RANGE_STORAGE_KEY = "imessage-insights:stats-range";
 const ACTIVITY_VIEW_STORAGE_KEY = "imessage-insights:activity-view";
 const HOUR_FORMAT_STORAGE_KEY = "imessage-insights:hour-format";
-const EMPTY_GHOSTING = { iGhosted: 0, theyGhostedMe: 0 } as const;
-const EMPTY_CONVERSATION_INIT = { startedByMe: 0, startedByOthers: 0 } as const;
+const EMPTY_UNANSWERED_STARTERS = { youLeftThemHanging: 0, theyLeftYouHanging: 0 } as const;
+const EMPTY_SESSION_STARTERS = { startedByMe: 0, startedByOthers: 0 } as const;
+const EMPTY_DOUBLE_TEXTS = { youDoubleTexted: 0, theyDoubleTexted: 0 } as const;
 const EMPTY_RESPONSE_DIRECTION = {
   averageSeconds: null,
   medianSeconds: null,
@@ -144,11 +150,6 @@ function readStoredValue<T>(key: string) {
   }
 }
 
-function getStoredStatsRange(): StatsRange {
-  const stored = readStoredValue<StatsRange>(STATS_RANGE_STORAGE_KEY);
-  return stored && statsRangeOptions.includes(stored) ? stored : "all";
-}
-
 function getStoredActivityView(): "hourly" | "weekday" {
   const stored = readStoredValue<"hourly" | "weekday">(ACTIVITY_VIEW_STORAGE_KEY);
   return stored && (["hourly", "weekday"] as const).includes(stored) ? stored : "hourly";
@@ -157,14 +158,6 @@ function getStoredActivityView(): "hourly" | "weekday" {
 function getStoredHourFormat(): HourClockMode {
   const stored = readStoredValue<HourClockMode>(HOUR_FORMAT_STORAGE_KEY);
   return stored && (["12h", "24h"] as const).includes(stored) ? stored : "24h";
-}
-
-function getRangeDates(range: StatsRange) {
-  if (range === "all") return {};
-  const now = new Date();
-  const duration = rangeDurations[range];
-  const start = new Date(now.getTime() - duration);
-  return { start: start.toISOString(), end: now.toISOString() };
 }
 
 const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -204,6 +197,19 @@ function formatCompactNumber(value: number | null | undefined) {
   if (!Number.isFinite(value ?? NaN) || (value ?? 0) <= 0) return "—";
   try {
     return compactFormatter.format(value as number);
+  } catch {
+    return formatNumber(value as number);
+  }
+}
+
+const rateFormatter = Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 1,
+});
+
+function formatRate(value: number | null | undefined) {
+  if (!Number.isFinite(value ?? NaN) || value === null || value === undefined) return "—";
+  try {
+    return rateFormatter.format(value as number);
   } catch {
     return formatNumber(value as number);
   }
@@ -332,7 +338,7 @@ type HourClockMode = "12h" | "24h";
 type ReportStatus = "idle" | "loading" | "error" | "success";
 
 const chatFilterOptions: { value: ChatFilterMode; label: string }[] = [
-  { value: "all", label: "All" },
+  { value: "all", label: "People" },
   { value: "direct", label: "Chats" },
   { value: "group", label: "Groups" },
 ];
@@ -430,7 +436,12 @@ function StatsOverviewSkeleton() {
 }
 
 export default function Dashboard() {
-  const [statsRange, setStatsRange] = useState<StatsRange>(() => getStoredStatsRange());
+  const { range, searchParams } = useGlobalRange();
+  const preservedQuery = searchParams.toString();
+  const querySuffix = preservedQuery ? `?${preservedQuery}` : "";
+  const overviewHref = `/${querySuffix}`;
+  const messagesHref = `/messages${querySuffix}`;
+  const callsHref = `/calls${querySuffix}`;
   const [chatFilterMode, setChatFilterMode] = useState<ChatFilterMode>("all");
   const [visibleChatCount, setVisibleChatCount] = useState(5);
   const [chatSearchQuery, setChatSearchQuery] = useState("");
@@ -444,15 +455,15 @@ export default function Dashboard() {
   const [reportStatus, setReportStatus] = useState<ReportStatus>("idle");
   const [reportError, setReportError] = useState<string | null>(null);
   const [reportUrl, setReportUrl] = useState<string | null>(null);
+  const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
 
   const statsQueryInput = useMemo(() => {
-    const rangeDates = getRangeDates(statsRange);
     return {
       limit: DEFAULT_STATS_LIMIT,
-      start: rangeDates.start,
-      end: rangeDates.end,
+      start: range.startIso,
+      end: range.endIso,
     };
-  }, [statsRange]);
+  }, [range.endIso, range.startIso]);
 
   const {
     data: statsData,
@@ -462,72 +473,238 @@ export default function Dashboard() {
     refetch: refetchStats,
   } = useStatsSummary(statsQueryInput);
 
-  const stats = statsData ?? null;
-  const responseTimes = stats?.responseTimes ?? null;
-  const myResponseStats = responseTimes?.meResponding ?? null;
-  const theirResponseStats = responseTimes?.themResponding ?? null;
-  const myResponseSummary = {
-    median: formatResponseDuration(myResponseStats?.medianSeconds),
-    p90: formatResponseDuration(myResponseStats?.p90Seconds),
-    fastest: formatResponseDuration(myResponseStats?.minSeconds),
-    slowest: formatResponseDuration(myResponseStats?.maxSeconds),
-    samples: myResponseStats?.sampleCount ?? 0,
+  const stats = (statsData as ConversationStats | undefined) ?? null;
+  const callsQuery = useQuery({
+    queryKey: ["calls", "all"],
+    queryFn: fetchAllCalls,
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+    refetchOnWindowFocus: true,
+    enabled: Boolean(selectedPersonId),
+    retry: 1,
+  });
+  const allCalls = callsQuery.data ?? [];
+  const callHistoryEarliest = useMemo(() => {
+    let earliest: Date | null = null;
+    for (const call of allCalls) {
+      const startedAt = parseDateTime(call.startedAt);
+      if (!startedAt) continue;
+      if (!earliest || startedAt < earliest) {
+        earliest = startedAt;
+      }
+    }
+    return earliest;
+  }, [allCalls]);
+  const firstReplyTimes = stats?.firstReplyTimes ?? null;
+  const inThreadReplyTimes = stats?.inThreadReplyTimes ?? null;
+
+  const myFirstReplyStats = firstReplyTimes?.meResponding ?? null;
+  const theirFirstReplyStats = firstReplyTimes?.themResponding ?? null;
+  const myFirstReplySummary = {
+    median: formatResponseDuration(myFirstReplyStats?.medianSeconds),
+    p90: formatResponseDuration(myFirstReplyStats?.p90Seconds),
+    fastest: formatResponseDuration(myFirstReplyStats?.minSeconds),
+    slowest: formatResponseDuration(myFirstReplyStats?.maxSeconds),
+    samples: myFirstReplyStats?.sampleCount ?? 0,
   };
-  const theirResponseSummary = {
-    median: formatResponseDuration(theirResponseStats?.medianSeconds),
-    p90: formatResponseDuration(theirResponseStats?.p90Seconds),
-    fastest: formatResponseDuration(theirResponseStats?.minSeconds),
-    slowest: formatResponseDuration(theirResponseStats?.maxSeconds),
-    samples: theirResponseStats?.sampleCount ?? 0,
+  const theirFirstReplySummary = {
+    median: formatResponseDuration(theirFirstReplyStats?.medianSeconds),
+    p90: formatResponseDuration(theirFirstReplyStats?.p90Seconds),
+    fastest: formatResponseDuration(theirFirstReplyStats?.minSeconds),
+    slowest: formatResponseDuration(theirFirstReplyStats?.maxSeconds),
+    samples: theirFirstReplyStats?.sampleCount ?? 0,
   };
-  const ghostingStats = useMemo(() => stats?.ghosting ?? EMPTY_GHOSTING, [stats]);
-  const conversationInitiationStats = useMemo(
-    () => stats?.conversationInitiation ?? EMPTY_CONVERSATION_INIT,
+  const myInThreadMedian = formatResponseDuration(inThreadReplyTimes?.meResponding?.medianSeconds);
+  const theirInThreadMedian = formatResponseDuration(inThreadReplyTimes?.themResponding?.medianSeconds);
+
+  const unansweredStarters = useMemo(
+    () => stats?.unansweredStarters ?? EMPTY_UNANSWERED_STARTERS,
     [stats],
   );
-  const ghostingThresholdLabel = formatDurationLabel(GHOST_RESPONSE_THRESHOLD_SECONDS);
-  const conversationGapLabel = formatDurationLabel(CONVERSATION_GAP_SECONDS);
-  const ghostingSummary = useMemo(() => {
-    const totalEvents = ghostingStats.iGhosted + ghostingStats.theyGhostedMe;
-    const theyPercent = totalEvents > 0 ? Math.round((ghostingStats.theyGhostedMe / totalEvents) * 100) : null;
+  const sessionStarters = useMemo(() => stats?.sessionStarters ?? EMPTY_SESSION_STARTERS, [stats]);
+  const doubleTexts = useMemo(() => stats?.doubleTexts ?? EMPTY_DOUBLE_TEXTS, [stats]);
+
+  const replyWindowLabel = formatDurationLabel(REPLY_WINDOW_SECONDS);
+  const sessionGapLabel = formatDurationLabel(SESSION_GAP_SECONDS);
+
+  const unansweredSummary = useMemo(() => {
+    const totalEvents = unansweredStarters.youLeftThemHanging + unansweredStarters.theyLeftYouHanging;
+    const theyPercent = totalEvents > 0 ? Math.round((unansweredStarters.theyLeftYouHanging / totalEvents) * 100) : null;
     const mePercent = totalEvents > 0 ? 100 - (theyPercent ?? 0) : null;
     const narrative =
       totalEvents === 0
-        ? "Not enough long pauses to assess yet."
-        : ghostingStats.theyGhostedMe > ghostingStats.iGhosted
-          ? "You get ghosted more often."
-          : ghostingStats.theyGhostedMe < ghostingStats.iGhosted
-            ? "You ghost more often."
-            : "Ghosting is evenly split.";
+        ? "No unanswered starts in this range."
+        : unansweredStarters.theyLeftYouHanging > unansweredStarters.youLeftThemHanging
+          ? "Others leave you hanging more often."
+          : unansweredStarters.theyLeftYouHanging < unansweredStarters.youLeftThemHanging
+            ? "You leave others hanging more often."
+            : "Unanswered starts are evenly split.";
     return { totalEvents, theyPercent, mePercent, narrative };
-  }, [ghostingStats]);
-  const conversationSummary = useMemo(() => {
-    const totalStarts = conversationInitiationStats.startedByMe + conversationInitiationStats.startedByOthers;
-    const mePercent = totalStarts > 0 ? Math.round((conversationInitiationStats.startedByMe / totalStarts) * 100) : null;
+  }, [unansweredStarters]);
+
+  const sessionStarterSummary = useMemo(() => {
+    const totalStarts = sessionStarters.startedByMe + sessionStarters.startedByOthers;
+    const mePercent = totalStarts > 0 ? Math.round((sessionStarters.startedByMe / totalStarts) * 100) : null;
     const othersPercent = totalStarts > 0 ? 100 - (mePercent ?? 0) : null;
     const narrative =
       totalStarts === 0
-        ? "No conversation gaps detected yet."
-        : conversationInitiationStats.startedByMe > conversationInitiationStats.startedByOthers
-          ? "You usually kick things off."
-          : conversationInitiationStats.startedByMe < conversationInitiationStats.startedByOthers
-            ? "Others start most conversations."
-            : "Conversation openers are evenly shared.";
+        ? "No sessions detected yet."
+        : sessionStarters.startedByMe > sessionStarters.startedByOthers
+          ? "You usually start sessions."
+          : sessionStarters.startedByMe < sessionStarters.startedByOthers
+            ? "Others start most sessions."
+            : "Session starters are evenly split.";
     return { totalStarts, mePercent, othersPercent, narrative };
-  }, [conversationInitiationStats]);
+  }, [sessionStarters]);
+
+  const doubleTextSummary = useMemo(() => {
+    const totalEvents = doubleTexts.youDoubleTexted + doubleTexts.theyDoubleTexted;
+    const theyPercent = totalEvents > 0 ? Math.round((doubleTexts.theyDoubleTexted / totalEvents) * 100) : null;
+    const mePercent = totalEvents > 0 ? 100 - (theyPercent ?? 0) : null;
+    const narrative =
+      totalEvents === 0
+        ? "No double texts in this range."
+        : doubleTexts.theyDoubleTexted > doubleTexts.youDoubleTexted
+          ? "Others double text more often."
+          : doubleTexts.theyDoubleTexted < doubleTexts.youDoubleTexted
+            ? "You double text more often."
+            : "Double texting is evenly split.";
+    return { totalEvents, theyPercent, mePercent, narrative };
+  }, [doubleTexts]);
   const statsErrorDetails = statsErrorRaw ? getStatsQueryError(statsErrorRaw) : null;
   const statsError = statsErrorDetails?.message ?? null;
   const accessError = statsErrorDetails?.httpStatus === 403;
 
   const totals = useMemo(() => computeTotals(stats), [stats]);
-  const sampledDayCount = stats?.dailyCounts.length ?? 0;
+  const rangeDayCount = useMemo(() => {
+    if (range.dayCount !== null) return range.dayCount;
+
+    const earliest = stats?.earliestMessageAt;
+    const latest = stats?.latestMessageAt;
+    if (!earliest || !latest) return null;
+    const startMs = new Date(earliest).getTime();
+    const endMs = new Date(latest).getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return null;
+    return Math.max(1, Math.ceil((endMs - startMs) / DAY_MS));
+  }, [range.dayCount, stats?.earliestMessageAt, stats?.latestMessageAt]);
+
   const averagePerDay = useMemo(() => {
-    if (!stats || sampledDayCount === 0) return null;
-    return Math.max(1, Math.round(totals.total / sampledDayCount));
-  }, [sampledDayCount, stats, totals.total]);
+    if (!stats || !rangeDayCount) return null;
+    return Math.max(0, totals.total / rangeDayCount);
+  }, [rangeDayCount, stats, totals.total]);
 
   const chatSearchTerm = chatSearchQuery.trim().toLowerCase();
   const isChatSearchActive = chatSearchTerm.length > 0;
+  const isPeopleView = chatFilterMode === "all";
+
+  type PersonConversationSummary = {
+    id: string;
+    displayName: string;
+    messageCount: number;
+    fromMeCount: number;
+    fromThemCount: number;
+    chatCount: number;
+    lastMessageAt: string | null;
+  };
+
+  const peopleConversationSummaries = useMemo<PersonConversationSummary[]>(() => {
+    if (!stats) return [];
+
+    const aggregate = new Map<
+      string,
+      {
+        id: string;
+        displayName: string;
+        messageCount: number;
+        fromMeCount: number;
+        fromThemCount: number;
+        chatIds: Set<number>;
+        lastMessageAt: string | null;
+      }
+    >();
+
+    for (const chat of stats.topChats ?? []) {
+      const mySent = Math.max(0, chat.sentCount ?? 0);
+      const lastMessageAt = chat.lastMessageAt ?? null;
+
+      for (const participant of chat.messageParticipants ?? []) {
+        const isSelf = Boolean(participant.isMe || participant.id === "me");
+        if (isSelf) continue;
+
+        const id = participant.id ?? participant.displayName ?? `unknown-${chat.chatId}`;
+        const displayName = participant.displayName ?? "Unknown";
+        const fromThem = Math.max(0, participant.messageCount ?? 0);
+
+        const existing =
+          aggregate.get(id) ??
+          {
+            id,
+            displayName,
+            messageCount: 0,
+            fromMeCount: 0,
+            fromThemCount: 0,
+            chatIds: new Set<number>(),
+            lastMessageAt: null,
+          };
+
+        existing.messageCount += mySent + fromThem;
+        existing.fromMeCount += mySent;
+        existing.fromThemCount += fromThem;
+        existing.chatIds.add(chat.chatId);
+
+        if (lastMessageAt) {
+          if (!existing.lastMessageAt || new Date(lastMessageAt) > new Date(existing.lastMessageAt)) {
+            existing.lastMessageAt = lastMessageAt;
+          }
+        }
+
+        if (existing.displayName === "Unknown" && displayName !== "Unknown") {
+          existing.displayName = displayName;
+        }
+
+        aggregate.set(id, existing);
+      }
+    }
+
+    return Array.from(aggregate.values())
+      .map((entry) => ({
+        id: entry.id,
+        displayName: entry.displayName,
+        messageCount: entry.messageCount,
+        fromMeCount: entry.fromMeCount,
+        fromThemCount: entry.fromThemCount,
+        chatCount: entry.chatIds.size,
+        lastMessageAt: entry.lastMessageAt,
+      }))
+      .sort(
+        (a, b) =>
+          b.messageCount - a.messageCount ||
+          b.fromThemCount - a.fromThemCount ||
+          a.displayName.localeCompare(b.displayName),
+      );
+  }, [stats]);
+
+  const selectedPersonSummary = useMemo(() => {
+    if (!selectedPersonId) return null;
+    return peopleConversationSummaries.find((person) => person.id === selectedPersonId) ?? null;
+  }, [peopleConversationSummaries, selectedPersonId]);
+
+  const selectedPerson = useMemo(() => {
+    if (!selectedPersonId) return null;
+    return {
+      key: selectedPersonId,
+      label: selectedPersonSummary?.displayName ?? "Unknown",
+    };
+  }, [selectedPersonId, selectedPersonSummary?.displayName]);
+
+  const filteredPeopleConversations = useMemo(() => {
+    if (!chatSearchTerm) return peopleConversationSummaries;
+    return peopleConversationSummaries.filter((person) => {
+      const name = person.displayName.toLowerCase();
+      const id = person.id.toLowerCase();
+      return name.includes(chatSearchTerm) || id.includes(chatSearchTerm);
+    });
+  }, [chatSearchTerm, peopleConversationSummaries]);
 
   const filteredTopChats = useMemo(() => {
     const chats = stats?.topChats ?? [];
@@ -552,16 +729,26 @@ export default function Dashboard() {
   const filteredChatCount = filteredTopChats.length;
   const previewedChatCount = topChatPreview.length;
   const totalChatCount = stats?.topChats.length ?? 0;
+  const topPeoplePreview = isChatSearchActive
+    ? filteredPeopleConversations
+    : filteredPeopleConversations.slice(0, visibleChatCount);
+  const filteredPeopleCount = filteredPeopleConversations.length;
+  const previewedPeopleCount = topPeoplePreview.length;
+  const totalPeopleCount = peopleConversationSummaries.length;
+  const topListPreviewCount = isPeopleView ? previewedPeopleCount : previewedChatCount;
+  const topListFilteredCount = isPeopleView ? filteredPeopleCount : filteredChatCount;
+  const topListTotalCount = isPeopleView ? totalPeopleCount : totalChatCount;
+  const topListLabel = isPeopleView ? "person" : "conversation";
   const reactionTotalsSummary = stats?.reactionTotals ?? null;
   const attachmentSummary = stats?.attachmentStats ?? null;
   const averageSentPerDay = useMemo(() => {
-    if (!stats || sampledDayCount === 0) return null;
-    return Math.max(0, Math.round(stats.totals.sentCount / sampledDayCount));
-  }, [sampledDayCount, stats]);
+    if (!stats || !rangeDayCount) return null;
+    return Math.max(0, stats.totals.sentCount / rangeDayCount);
+  }, [rangeDayCount, stats]);
   const averageReceivedPerDay = useMemo(() => {
-    if (!stats || sampledDayCount === 0) return null;
-    return Math.max(0, Math.round(stats.totals.receivedCount / sampledDayCount));
-  }, [sampledDayCount, stats]);
+    if (!stats || !rangeDayCount) return null;
+    return Math.max(0, stats.totals.receivedCount / rangeDayCount);
+  }, [rangeDayCount, stats]);
   const earliestMessageDate = useMemo(() => {
     if (stats?.earliestMessageAt) {
       return stats.earliestMessageAt;
@@ -582,10 +769,10 @@ export default function Dashboard() {
         value: formatCompactNumber(totals.total),
         description: totals.total ? `${formatNumber(totals.total)} messages` : undefined,
         meta:
-          statsRange === "all" && earliestMessageDate
+          range.mode === "preset" && range.preset === "all" && earliestMessageDate
             ? `Since ${formatDayLabel(earliestMessageDate)}`
-            : sampledDayCount > 0
-              ? `Across ${formatNumber(sampledDayCount)} day${sampledDayCount === 1 ? "" : "s"}`
+            : rangeDayCount
+              ? `Across ${formatNumber(rangeDayCount)} day${rangeDayCount === 1 ? "" : "s"}`
               : undefined,
       },
       {
@@ -623,23 +810,25 @@ export default function Dashboard() {
       {
         key: "pace",
         label: "Daily average",
-        value: averagePerDay ? formatNumber(averagePerDay) : "—",
+        value: averagePerDay === null ? "—" : formatRate(averagePerDay),
         description:
-          sampledDayCount > 0 ? `Average across ${formatNumber(sampledDayCount)} day${sampledDayCount === 1 ? "" : "s"}` : undefined,
+          rangeDayCount
+            ? `Average across ${formatNumber(rangeDayCount)} day${rangeDayCount === 1 ? "" : "s"}`
+            : undefined,
         badges: [
-          averageSentPerDay
+          totals.sent
             ? {
                 key: "pace-sent",
                 label: "Sent",
-                value: `${formatNumber(averageSentPerDay)}/day`,
+                value: `${formatRate(averageSentPerDay)}/day`,
                 tone: "emerald",
               }
             : null,
-          averageReceivedPerDay
+          totals.received
             ? {
                 key: "pace-received",
                 label: "Received",
-                value: `${formatNumber(averageReceivedPerDay)}/day`,
+                value: `${formatRate(averageReceivedPerDay)}/day`,
                 tone: "sky",
               }
             : null,
@@ -678,14 +867,14 @@ export default function Dashboard() {
             : "No attachments yet";
       const attachmentBadges =
         attachmentSummary.topSender && attachmentSummary.topSender.count > 0
-          ? [
+          ? ([
               {
                 key: "attachments-top",
                 label: attachmentSummary.topSender.isMe ? "Top sender (you)" : "Top sender",
                 value: `${attachmentSummary.topSender.displayName ?? "Unknown"} · ${formatNumber(attachmentSummary.topSender.count)}`,
                 tone: "violet",
               },
-            ]
+            ] as SummaryCardBadge[])
           : undefined;
       cards.push({
         key: "attachments",
@@ -706,8 +895,9 @@ export default function Dashboard() {
     averageSentPerDay,
     earliestMessageDate,
     reactionTotalsSummary,
-    sampledDayCount,
-    statsRange,
+    rangeDayCount,
+    range.mode,
+    range.preset,
     totals.received,
     totals.sent,
     totals.total,
@@ -793,7 +983,7 @@ export default function Dashboard() {
       });
     }
 
-    const allowBusiestDayInsight = !singleDayRangeOptions.includes(statsRange);
+    const allowBusiestDayInsight = range.dayCount === null || range.dayCount > 1;
     if (allowBusiestDayInsight) {
       const busiestDayBucket = stats.dailyCounts.reduce<DailyCount | null>((max, bucket) => {
         if (!max) return bucket;
@@ -864,30 +1054,42 @@ export default function Dashboard() {
       }
     }
 
-    if (ghostingSummary.totalEvents > 0) {
-      const leaningToOthers = ghostingStats.theyGhostedMe >= ghostingStats.iGhosted;
+    if (unansweredSummary.totalEvents > 0) {
+      const leaningToOthers = unansweredStarters.theyLeftYouHanging >= unansweredStarters.youLeftThemHanging;
       const share = formatPercent(
-        leaningToOthers ? ghostingStats.theyGhostedMe : ghostingStats.iGhosted,
-        ghostingSummary.totalEvents,
+        leaningToOthers ? unansweredStarters.theyLeftYouHanging : unansweredStarters.youLeftThemHanging,
+        unansweredSummary.totalEvents,
       );
       items.push({
-        key: "ghosting",
-        label: "Ghosting radar",
-        primary: ghostingSummary.narrative,
-        secondary: `${share} of long silences`,
+        key: "unanswered-starts",
+        label: "Unanswered starts",
+        primary: unansweredSummary.narrative,
+        secondary: `${share} of unanswered starts`,
         icon: <GhostIcon className="h-4 w-4 text-rose-200" />,
       });
     }
 
-    if (conversationSummary.totalStarts > 0) {
+    if (doubleTextSummary.totalEvents > 0) {
+      const leaningToOthers = doubleTexts.theyDoubleTexted >= doubleTexts.youDoubleTexted;
+      const share = formatPercent(
+        leaningToOthers ? doubleTexts.theyDoubleTexted : doubleTexts.youDoubleTexted,
+        doubleTextSummary.totalEvents,
+      );
       items.push({
-        key: "conversation-starters",
-        label: "Conversation openers",
-        primary: conversationSummary.narrative,
-        secondary: `${formatPercent(
-          conversationInitiationStats.startedByMe,
-          conversationSummary.totalStarts,
-        )} start with you`,
+        key: "double-texts",
+        label: "Double texts",
+        primary: doubleTextSummary.narrative,
+        secondary: `${share} of double texts`,
+        icon: <DirectChatIcon className="h-4 w-4 text-indigo-200" />,
+      });
+    }
+
+    if (sessionStarterSummary.totalStarts > 0) {
+      items.push({
+        key: "session-starters",
+        label: "Session starters",
+        primary: sessionStarterSummary.narrative,
+        secondary: `${formatPercent(sessionStarters.startedByMe, sessionStarterSummary.totalStarts)} start with you`,
         icon: <SparkIcon className="h-4 w-4 text-amber-200" />,
       });
     }
@@ -895,13 +1097,15 @@ export default function Dashboard() {
     return items;
   }, [
     attachmentSummary,
-    conversationInitiationStats,
-    conversationSummary,
-    ghostingStats,
-    ghostingSummary,
+    doubleTexts,
+    doubleTextSummary,
     stats,
-    statsRange,
+    range.dayCount,
     totals.total,
+    unansweredStarters,
+    unansweredSummary,
+    sessionStarters,
+    sessionStarterSummary,
   ]);
   const insightGridClass = useMemo(() => {
     const count = insightItems.length;
@@ -980,33 +1184,145 @@ export default function Dashboard() {
   const latestActivitySource = stats?.latestMessageAt ?? mostActiveChat?.lastMessageAt ?? null;
   const latestActivityLabel = stats ? formatDateTime(latestActivitySource) : "Waiting for data";
   const topConversationsTitle =
-    chatFilterMode === "group" ? "Top Groups" : chatFilterMode === "direct" ? "Top Chats" : "Top Conversations";
+    chatFilterMode === "all" ? "Top People" : chatFilterMode === "group" ? "Top Groups" : "Top Chats";
   const buildReportUrl = useCallback(
     (chat: ChatSummary) => {
       const params = new URLSearchParams();
-      const rangeDates = getRangeDates(statsRange);
-      if (rangeDates.start) params.set("start", rangeDates.start);
-      if (rangeDates.end) params.set("end", rangeDates.end);
+      if (range.startIso) params.set("start", range.startIso);
+      if (range.endIso) params.set("end", range.endIso);
       const query = params.toString();
       return `/reports/${chat.chatId}${query ? `?${query}` : ""}`;
     },
-    [statsRange],
+    [range.endIso, range.startIso],
   );
+
+  const selectedMessageThreads = useMemo<PersonMessageThread[]>(() => {
+    if (!selectedPersonId || !stats) return [];
+    const threads: PersonMessageThread[] = [];
+    for (const chat of stats.topChats ?? []) {
+      const mySent = Math.max(0, chat.sentCount ?? 0);
+      const lastMessageAt = parseDateTime(chat.lastMessageAt ?? null);
+      const participant = (chat.messageParticipants ?? []).find((p) => {
+        const isSelf = Boolean(p.isMe || p.id === "me");
+        if (isSelf) return false;
+        const key = p.id ?? p.displayName ?? `unknown-${chat.chatId}`;
+        return key === selectedPersonId;
+      });
+      if (!participant) continue;
+      const fromThem = Math.max(0, participant.messageCount ?? 0);
+      const label =
+        chat.chatDisplayName ??
+        (chat.participants.length > 0 ? chat.participants.join(", ") : `Chat ${chat.chatId}`);
+      threads.push({
+        chatId: chat.chatId,
+        label,
+        isGroup: Boolean(chat.isGroup),
+        totalMessages: mySent + fromThem,
+        fromMeMessages: mySent,
+        fromThemMessages: fromThem,
+        lastMessageAt,
+        href: buildReportUrl(chat),
+      });
+    }
+    return threads
+      .sort(
+        (a, b) =>
+          b.totalMessages - a.totalMessages ||
+          (b.lastMessageAt?.getTime() ?? 0) - (a.lastMessageAt?.getTime() ?? 0) ||
+          a.label.localeCompare(b.label),
+      )
+      .slice(0, 8);
+  }, [buildReportUrl, selectedPersonId, stats]);
+
+  const selectedMessageStats = useMemo<PersonMessageStats | null>(() => {
+    if (!selectedPersonSummary) return null;
+    return {
+      totalMessages: selectedPersonSummary.messageCount,
+      fromMeMessages: selectedPersonSummary.fromMeCount,
+      fromThemMessages: selectedPersonSummary.fromThemCount,
+      chatCount: selectedPersonSummary.chatCount,
+      lastMessageAt: parseDateTime(selectedPersonSummary.lastMessageAt),
+      threads: selectedMessageThreads,
+    };
+  }, [selectedMessageThreads, selectedPersonSummary]);
+
+  const selectedCallStats = useMemo<PersonCallStats | null>(() => {
+    if (!selectedPersonId) return null;
+    let totalCalls = 0;
+    let incomingCalls = 0;
+    let outgoingCalls = 0;
+    let answeredCalls = 0;
+    let missedIncomingCalls = 0;
+    let talkSeconds = 0;
+    let lastCallAt: Date | null = null;
+    const recentCalls: PersonRecentCall[] = [];
+
+    const start = range.startDate;
+    const end = range.endDate;
+
+    for (const call of allCalls) {
+      const startedAt = parseDateTime(call.startedAt);
+      if (!startedAt) continue;
+      if (start && startedAt < start) continue;
+      if (end && startedAt > end) continue;
+
+      const participants = getCallParticipants(call);
+      const keys = new Set(
+        participants.map((participant) => participant.id ?? participant.handle).filter(Boolean),
+      );
+      if (!keys.has(selectedPersonId)) continue;
+
+      totalCalls += 1;
+      if (call.direction === "incoming") incomingCalls += 1;
+      if (call.direction === "outgoing") outgoingCalls += 1;
+      if (call.answered) answeredCalls += 1;
+      if (call.direction === "incoming" && !call.answered) missedIncomingCalls += 1;
+
+      const duration = Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
+      talkSeconds += duration;
+
+      if (!lastCallAt || startedAt > lastCallAt) {
+        lastCallAt = startedAt;
+      }
+
+      recentCalls.push({
+        callId: call.callId,
+        startedAt,
+        durationSeconds: duration,
+        answered: call.answered,
+        direction: call.direction,
+        provider: call.provider,
+        media: call.media,
+      });
+    }
+
+    recentCalls.sort(
+      (a, b) =>
+        (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0) ||
+        b.callId - a.callId,
+    );
+
+    return {
+      totalCalls,
+      incomingCalls,
+      outgoingCalls,
+      answeredCalls,
+      missedIncomingCalls,
+      talkSeconds,
+      lastCallAt,
+      recentCalls: recentCalls.slice(0, 8),
+      callsInRange: recentCalls,
+    };
+  }, [allCalls, range.endDate, range.startDate, selectedPersonId]);
+
+  const callsError =
+    callsQuery.error instanceof Error ? callsQuery.error.message : callsQuery.error ? "Unable to load calls." : null;
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     const stored = window.localStorage.getItem(ACCESS_TIP_STORAGE_KEY);
     setAccessTipDismissed(stored === "true");
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      window.localStorage.setItem(STATS_RANGE_STORAGE_KEY, statsRange);
-    } catch {
-      // ignore
-    }
-  }, [statsRange]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1042,75 +1358,58 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-neutral-950 pb-16 text-neutral-100">
-      <header className="relative overflow-hidden border-b border-neutral-900/60 bg-neutral-950/95 py-6">
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute inset-0 bg-gradient-to-b from-emerald-500/10 via-transparent to-transparent" />
-          <div className="absolute inset-y-0 right-0 w-1/2 bg-gradient-to-l from-sky-500/20 via-transparent to-transparent blur-3xl opacity-60" />
-        </div>
-        <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-6 px-6">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-3 text-[0.65rem] font-semibold uppercase tracking-wide text-emerald-200">
-              <span className="rounded-full border border-emerald-400/40 bg-emerald-400/10 px-3 py-1">Beta</span>
-              <span className="text-neutral-500">On-device analytics</span>
+      <header className="border-b border-neutral-900/60 bg-neutral-950/95 py-6">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Link
+                href={overviewHref}
+                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
+              >
+                Overview
+              </Link>
+              <Link
+                href={messagesHref}
+                className="rounded-full border border-neutral-800/80 bg-white/5 px-3 py-1 text-xs font-semibold text-white"
+              >
+                Messages
+              </Link>
+              <Link
+                href={callsHref}
+                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
+              >
+                Calls
+              </Link>
             </div>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-neutral-400">
-              <div className="flex items-center gap-2 rounded-full border border-neutral-800/80 bg-neutral-900/80 px-3 py-1">
+
+            <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400">
+              <div className="flex items-center gap-2 rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1">
                 <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-                <span>{stats ? `Latest activity ${latestActivityLabel}` : "Awaiting first sync…"}</span>
+                <span>{stats ? `Latest ${latestActivityLabel}` : "Waiting for data…"}</span>
               </div>
               <button
                 type="button"
                 onClick={handleStatsRefresh}
-                className="rounded-full border border-emerald-500/40 bg-emerald-500/10 p-1.5 text-emerald-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-emerald-400/80 hover:bg-emerald-400/20 hover:text-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70"
+                className="rounded-full border border-neutral-800/80 bg-neutral-900/70 px-3 py-1 font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
               >
-                <span className="sr-only">Refresh stats</span>
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
-                  <path
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.7"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M4.5 12a7.5 7.5 0 0113.5-4.472M19.5 5.25v4.5m0-4.5h-4.5M19.5 12a7.5 7.5 0 01-13.5 4.472M4.5 18.75v-4.5m0 4.5h4.5"
-                  />
-                </svg>
+                Refresh
               </button>
             </div>
           </div>
-          <div className="flex flex-wrap items-end justify-between gap-4">
-            <div>
-              <h1 className="text-3xl font-semibold tracking-tight text-white">Messages Analytics</h1>
-              <p className="mt-1 text-sm text-neutral-400">
-                Instant insights into your busiest chats, streaks, and reaction habits.
-              </p>
-            </div>
+
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-white">Messages</h1>
           </div>
         </div>
       </header>
 
       <main className="mx-auto mt-10 flex w-full max-w-6xl flex-col gap-10 px-6">
+        <GlobalRangeBar />
         <section className="space-y-6">
           <div className="space-y-4 rounded-2xl border border-neutral-800/70 bg-neutral-900/40 p-6 shadow-lg shadow-black/30">
             <div className="flex flex-wrap items-center gap-3">
               <div className="flex items-center gap-2">
                 <h2 className="text-lg font-semibold text-white">Statistics</h2>
-              </div>
-              <div className="ml-auto flex flex-wrap items-center gap-2 text-xs text-neutral-400">
-                {statsRangeOptions.map((rangeOption) => (
-                  <button
-                    key={rangeOption}
-                    type="button"
-                    onClick={() => setStatsRange(rangeOption)}
-                    aria-pressed={statsRange === rangeOption}
-                    className={`rounded-full border px-3 py-1 font-semibold transition ${
-                      statsRange === rangeOption
-                        ? "border-emerald-400/70 bg-emerald-400/90 text-emerald-950 shadow shadow-emerald-500/30"
-                        : "border-neutral-800/80 text-neutral-300 hover:border-neutral-600 hover:text-white"
-                    }`}
-                  >
-                    {rangeOption === "all" ? "All Time" : rangeOption}
-                  </button>
-                ))}
               </div>
             </div>
             {statsError && <p className="text-sm text-red-400">{statsError}</p>}
@@ -1174,147 +1473,186 @@ export default function Dashboard() {
                     );
                   })}
                 </div>
-                <div className="grid gap-3 md:grid-cols-2">
+                <div className="grid gap-3 md:grid-cols-3">
                   <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
                     <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
                       <GhostIcon className="h-4 w-4 text-rose-200" />
-                      <span>Ghosting tendency</span>
+                      <span>Unanswered starts</span>
                     </div>
                     <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-neutral-400">
                       <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">They ghosted you</p>
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">They left you hanging</p>
                         <p className="mt-1 text-2xl font-semibold text-rose-100">
-                          {formatNumber(ghostingStats.theyGhostedMe)}
+                          {formatNumber(unansweredStarters.theyLeftYouHanging)}
                         </p>
-                        {ghostingSummary.theyPercent !== null && (
-                          <p className="text-xs text-neutral-500">{ghostingSummary.theyPercent}% of long silences</p>
+                        {unansweredSummary.theyPercent !== null && (
+                          <p className="text-xs text-neutral-500">{unansweredSummary.theyPercent}% of unanswered starts</p>
                         )}
                       </div>
                       <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">You ghosted them</p>
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">You left them hanging</p>
                         <p className="mt-1 text-2xl font-semibold text-emerald-100">
-                          {formatNumber(ghostingStats.iGhosted)}
+                          {formatNumber(unansweredStarters.youLeftThemHanging)}
                         </p>
-                        {ghostingSummary.mePercent !== null && (
-                          <p className="text-xs text-neutral-500">{ghostingSummary.mePercent}% of long silences</p>
+                        {unansweredSummary.mePercent !== null && (
+                          <p className="text-xs text-neutral-500">{unansweredSummary.mePercent}% of unanswered starts</p>
                         )}
                       </div>
                     </div>
                     <div className="mt-4 flex h-2 w-full overflow-hidden rounded-full bg-neutral-900">
                       <div
                         className="h-full bg-emerald-400/70"
-                        style={{ width: `${ghostingSummary.mePercent ?? 50}%` }}
+                        style={{ width: `${unansweredSummary.mePercent ?? 50}%` }}
                       />
                       <div
                         className="h-full bg-rose-400/80"
-                        style={{ width: `${ghostingSummary.theyPercent ?? 50}%` }}
+                        style={{ width: `${unansweredSummary.theyPercent ?? 50}%` }}
                       />
                     </div>
-                    <p className="mt-3 text-sm text-neutral-200">{ghostingSummary.narrative}</p>
+                    <p className="mt-3 text-sm text-neutral-200">{unansweredSummary.narrative}</p>
                     <p className="text-[11px] text-neutral-500">
-                      We count a “ghost” whenever the other side doesn’t reply within {ghostingThresholdLabel}.
+                      We count an unanswered start when the other side doesn’t reply within {replyWindowLabel}.
                     </p>
                   </div>
                   <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
                     <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
                       <SparkIcon className="h-4 w-4 text-amber-200" />
-                      <span>Conversation openers</span>
+                      <span>Session starters</span>
                     </div>
                     <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-neutral-400">
                       <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
                         <p className="text-[11px] uppercase tracking-wide text-neutral-500">You start</p>
                         <p className="mt-1 text-2xl font-semibold text-emerald-100">
-                          {formatNumber(conversationInitiationStats.startedByMe)}
+                          {formatNumber(sessionStarters.startedByMe)}
                         </p>
-                        {conversationSummary.mePercent !== null && (
-                          <p className="text-xs text-neutral-500">{conversationSummary.mePercent}% of sessions</p>
+                        {sessionStarterSummary.mePercent !== null && (
+                          <p className="text-xs text-neutral-500">{sessionStarterSummary.mePercent}% of sessions</p>
                         )}
                       </div>
                       <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
                         <p className="text-[11px] uppercase tracking-wide text-neutral-500">They start</p>
                         <p className="mt-1 text-2xl font-semibold text-sky-100">
-                          {formatNumber(conversationInitiationStats.startedByOthers)}
+                          {formatNumber(sessionStarters.startedByOthers)}
                         </p>
-                        {conversationSummary.othersPercent !== null && (
-                          <p className="text-xs text-neutral-500">{conversationSummary.othersPercent}% of sessions</p>
+                        {sessionStarterSummary.othersPercent !== null && (
+                          <p className="text-xs text-neutral-500">{sessionStarterSummary.othersPercent}% of sessions</p>
                         )}
                       </div>
                     </div>
                     <div className="mt-4 flex h-2 w-full overflow-hidden rounded-full bg-neutral-900">
                       <div
                         className="h-full bg-emerald-400/70"
-                        style={{ width: `${conversationSummary.mePercent ?? 50}%` }}
+                        style={{ width: `${sessionStarterSummary.mePercent ?? 50}%` }}
                       />
                       <div
                         className="h-full bg-sky-400/80"
-                        style={{ width: `${conversationSummary.othersPercent ?? 50}%` }}
+                        style={{ width: `${sessionStarterSummary.othersPercent ?? 50}%` }}
                       />
                     </div>
-                    <p className="mt-3 text-sm text-neutral-200">{conversationSummary.narrative}</p>
+                    <p className="mt-3 text-sm text-neutral-200">{sessionStarterSummary.narrative}</p>
                     <p className="text-[11px] text-neutral-500">
-                      A new “conversation” begins after {conversationGapLabel} of silence, and we credit whoever sends the
-                      first message after that gap.
+                      A new session begins after {sessionGapLabel} of silence.
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
+                      <DirectChatIcon className="h-4 w-4 text-indigo-200" />
+                      <span>Double texts</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-neutral-400">
+                      <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">You</p>
+                        <p className="mt-1 text-2xl font-semibold text-emerald-100">
+                          {formatNumber(doubleTexts.youDoubleTexted)}
+                        </p>
+                        {doubleTextSummary.mePercent !== null && (
+                          <p className="text-xs text-neutral-500">{doubleTextSummary.mePercent}% of double texts</p>
+                        )}
+                      </div>
+                      <div className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
+                        <p className="text-[11px] uppercase tracking-wide text-neutral-500">Them</p>
+                        <p className="mt-1 text-2xl font-semibold text-indigo-100">
+                          {formatNumber(doubleTexts.theyDoubleTexted)}
+                        </p>
+                        {doubleTextSummary.theyPercent !== null && (
+                          <p className="text-xs text-neutral-500">{doubleTextSummary.theyPercent}% of double texts</p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-4 flex h-2 w-full overflow-hidden rounded-full bg-neutral-900">
+                      <div
+                        className="h-full bg-emerald-400/70"
+                        style={{ width: `${doubleTextSummary.mePercent ?? 50}%` }}
+                      />
+                      <div
+                        className="h-full bg-indigo-400/80"
+                        style={{ width: `${doubleTextSummary.theyPercent ?? 50}%` }}
+                      />
+                    </div>
+                    <p className="mt-3 text-sm text-neutral-200">{doubleTextSummary.narrative}</p>
+                    <p className="text-[11px] text-neutral-500">
+                      We count a double text when someone sends 2+ messages before a reply (within {replyWindowLabel}).
                     </p>
                   </div>
                 </div>
-                {responseTimes && (
+                {firstReplyTimes && (
                   <div className="grid gap-3 md:grid-cols-2">
                     <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
                       <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
                         <ClockIcon className="h-4 w-4 text-emerald-200" />
-                        <span>Your response time</span>
+                        <span>Your first reply</span>
                       </div>
-                      <p className="mt-3 text-3xl font-semibold text-emerald-100">{myResponseSummary.median}</p>
-                      <p className="text-xs text-neutral-400">Median reply</p>
+                      <p className="mt-3 text-3xl font-semibold text-emerald-100">{myFirstReplySummary.median}</p>
+                      <p className="text-xs text-neutral-400">Median first reply</p>
                       <p className="text-xs text-neutral-500">
-                        90% of replies within {myResponseSummary.p90}
+                        90% within {myFirstReplySummary.p90}
                       </p>
                       <div className="mt-3 grid grid-cols-2 gap-3 text-[11px] text-neutral-400">
                         <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
                           <p className="text-neutral-500">Fastest</p>
-                          <p className="text-neutral-100">{myResponseSummary.fastest}</p>
+                          <p className="text-neutral-100">{myFirstReplySummary.fastest}</p>
                         </div>
                         <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
                           <p className="text-neutral-500">Slowest</p>
-                          <p className="text-neutral-100">{myResponseSummary.slowest}</p>
+                          <p className="text-neutral-100">{myFirstReplySummary.slowest}</p>
                         </div>
                       </div>
                       <p className="mt-3 text-[11px] text-neutral-500">
-                        {myResponseSummary.samples
-                          ? `${formatNumber(myResponseSummary.samples)} replies measured`
+                        {myFirstReplySummary.samples
+                          ? `${formatNumber(myFirstReplySummary.samples)} first replies measured`
                           : "No replies measured yet."}
                       </p>
                       <p className="text-[11px] text-neutral-600">
-                        Only replies within {conversationGapLabel} count toward this metric.
+                        Session start → first reply (within {replyWindowLabel}). In-thread median: {myInThreadMedian}.
                       </p>
                     </div>
                     <div className="rounded-2xl border border-neutral-800/80 bg-neutral-950/70 p-4">
                       <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-neutral-400">
                         <ClockIcon className="h-4 w-4 text-sky-200" />
-                        <span>Their response time</span>
+                        <span>Their first reply</span>
                       </div>
-                      <p className="mt-3 text-3xl font-semibold text-sky-100">{theirResponseSummary.median}</p>
-                      <p className="text-xs text-neutral-400">Median reply</p>
+                      <p className="mt-3 text-3xl font-semibold text-sky-100">{theirFirstReplySummary.median}</p>
+                      <p className="text-xs text-neutral-400">Median first reply</p>
                       <p className="text-xs text-neutral-500">
-                        90% of replies within {theirResponseSummary.p90}
+                        90% within {theirFirstReplySummary.p90}
                       </p>
                       <div className="mt-3 grid grid-cols-2 gap-3 text-[11px] text-neutral-400">
                         <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
                           <p className="text-neutral-500">Fastest</p>
-                          <p className="text-neutral-100">{theirResponseSummary.fastest}</p>
+                          <p className="text-neutral-100">{theirFirstReplySummary.fastest}</p>
                         </div>
                         <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2">
                           <p className="text-neutral-500">Slowest</p>
-                          <p className="text-neutral-100">{theirResponseSummary.slowest}</p>
+                          <p className="text-neutral-100">{theirFirstReplySummary.slowest}</p>
                         </div>
                       </div>
                       <p className="mt-3 text-[11px] text-neutral-500">
-                        {theirResponseSummary.samples
-                          ? `${formatNumber(theirResponseSummary.samples)} replies measured`
+                        {theirFirstReplySummary.samples
+                          ? `${formatNumber(theirFirstReplySummary.samples)} first replies measured`
                           : "No replies measured yet."}
                       </p>
                       <p className="text-[11px] text-neutral-600">
-                        Only replies within {conversationGapLabel} count toward this metric.
+                        Session start → first reply (within {replyWindowLabel}). In-thread median: {theirInThreadMedian}.
                       </p>
                     </div>
                   </div>
@@ -1384,7 +1722,7 @@ export default function Dashboard() {
                       </label>
                       <div className="ml-auto flex-1 min-w-[200px]">
                         <label htmlFor="chat-search" className="sr-only">
-                          Search chats
+                          {isPeopleView ? "Search people" : "Search chats"}
                         </label>
                         <div className="relative text-neutral-300">
                           <svg
@@ -1406,7 +1744,13 @@ export default function Dashboard() {
                             type="search"
                             value={chatSearchQuery}
                             onChange={(event) => setChatSearchQuery(event.target.value)}
-                            placeholder="Search chats or groups"
+                            placeholder={
+                              isPeopleView
+                                ? "Search people"
+                                : chatFilterMode === "group"
+                                  ? "Search groups"
+                                  : "Search chats"
+                            }
                             className="w-full rounded border border-neutral-700 bg-neutral-950 py-1.5 pl-8 pr-8 text-sm text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
                           />
                           {chatSearchQuery && (
@@ -1433,18 +1777,82 @@ export default function Dashboard() {
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-neutral-500">
                     <span>
-                      Showing {previewedChatCount} of {filteredChatCount}{" "}
-                      {filteredChatCount === 1 ? "conversation" : "conversations"}
+                      Showing {topListPreviewCount} of {topListFilteredCount}{" "}
+                      {topListFilteredCount === 1 ? topListLabel : isPeopleView ? "people" : "conversations"}
                     </span>
-                    {filteredChatCount !== totalChatCount && totalChatCount > 0 && (
+                    {topListFilteredCount !== topListTotalCount && topListTotalCount > 0 && (
                       <span className="text-neutral-600">•</span>
                     )}
-                    {filteredChatCount !== totalChatCount && totalChatCount > 0 && (
-                      <span>{formatNumber(totalChatCount)} in range</span>
+                    {topListFilteredCount !== topListTotalCount && topListTotalCount > 0 && (
+                      <span>{formatNumber(topListTotalCount)} in view</span>
                     )}
                   </div>
+                  {isPeopleView && (
+                    <p className="mt-2 text-[11px] text-neutral-600">
+                      Counts include your messages in shared group chats.
+                    </p>
+                  )}
                     <div className="mt-3 space-y-3">
-                      {topChatPreview.length === 0 ? (
+                      {isPeopleView ? (
+                        topPeoplePreview.length === 0 ? (
+                          <div className="rounded-xl border border-dashed border-neutral-800/80 bg-neutral-950/40 p-6 text-center text-sm text-neutral-400">
+                            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full border border-neutral-800/80 bg-neutral-900/80">
+                              <DirectChatIcon className="h-4 w-4 text-neutral-500" />
+                            </div>
+                            <p className="mt-3 font-medium text-neutral-200">
+                              {isChatSearchActive
+                                ? "No people match this search."
+                                : filteredPeopleCount === 0
+                                  ? "No people in this range yet."
+                                  : "No people in this view."}
+                            </p>
+                            <p className="text-xs text-neutral-500">
+                              Try expanding the range or clearing filters to see more people.
+                            </p>
+                          </div>
+                        ) : (
+                          topPeoplePreview.map((person, index) => {
+                            const latestLabel = formatDateTime(person.lastMessageAt);
+                            const isTopEntry = index === 0;
+                            const cardClasses = isTopEntry
+                              ? "border-emerald-500/60 bg-gradient-to-r from-emerald-500/15 via-neutral-950/70 to-neutral-950/40 shadow shadow-emerald-500/20"
+                              : "border-neutral-800 bg-neutral-950/70";
+                            return (
+                              <button
+                                key={person.id}
+                                type="button"
+                                onClick={() => setSelectedPersonId(person.id)}
+                                className={`w-full rounded-lg border p-4 text-left transition-all duration-300 hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 ${cardClasses}`}
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs uppercase tracking-wide text-neutral-500">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="rounded-full border border-neutral-800/80 px-2 py-0.5 text-[10px] font-semibold text-neutral-400">
+                                      #{index + 1}
+                                    </span>
+                                    <DirectChatIcon className="h-3.5 w-3.5 text-indigo-300" />
+                                    <span>Person</span>
+                                    {person.lastMessageAt && (
+                                      <>
+                                        <span className="text-neutral-700">•</span>
+                                        <span>Latest {latestLabel}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                  <span className="text-neutral-400">{formatNumber(person.messageCount)} msgs</span>
+                                </div>
+                                <div className="mt-2 flex items-center justify-between gap-3">
+                                  <p className="text-sm font-medium text-neutral-100">{person.displayName}</p>
+                                  <span className="text-xs text-neutral-500">{formatNumber(person.chatCount)} chats</span>
+                                </div>
+                                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-neutral-400">
+                                  <span className="text-emerald-300">↑ You {formatNumber(person.fromMeCount)}</span>
+                                  <span className="text-sky-300">↓ Them {formatNumber(person.fromThemCount)}</span>
+                                </div>
+                              </button>
+                            );
+                          })
+                        )
+                      ) : topChatPreview.length === 0 ? (
                         <div className="rounded-xl border border-dashed border-neutral-800/80 bg-neutral-950/40 p-6 text-center text-sm text-neutral-400">
                           <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full border border-neutral-800/80 bg-neutral-900/80">
                             <DirectChatIcon className="h-4 w-4 text-neutral-500" />
@@ -1468,11 +1876,20 @@ export default function Dashboard() {
                           const iconColor = chat.isGroup ? "text-rose-300" : "text-indigo-300";
                           const earliestLabel = formatDateTime(chat.firstMessageAt);
                           const latestLabel = formatDateTime(chat.lastMessageAt);
-                          const chatResponseTimes =
-                            chat.responseTimes ??
+                          const chatFirstReplyTimes =
+                            chat.firstReplyTimes ??
                             createEmptyResponseStatsClient();
-                          const chatMyResponse = chatResponseTimes.meResponding;
-                          const chatTheirResponse = chatResponseTimes.themResponding;
+                          const chatInThreadReplyTimes =
+                            chat.inThreadReplyTimes ??
+                            createEmptyResponseStatsClient();
+                          const chatMyFirstReply = chatFirstReplyTimes.meResponding;
+                          const chatTheirFirstReply = chatFirstReplyTimes.themResponding;
+                          const chatMyInThreadMedian = formatResponseDuration(
+                            chatInThreadReplyTimes.meResponding.medianSeconds,
+                          );
+                          const chatTheirInThreadMedian = formatResponseDuration(
+                            chatInThreadReplyTimes.themResponding.medianSeconds,
+                          );
                           const isTopEntry = index === 0;
                           const cardClasses = isTopEntry
                             ? "border-emerald-500/60 bg-gradient-to-r from-emerald-500/15 via-neutral-950/70 to-neutral-950/40 shadow shadow-emerald-500/20"
@@ -1524,60 +1941,87 @@ export default function Dashboard() {
                         <span className="text-emerald-300">↑ {formatNumber(chat.sentCount)}</span>
                         <span className="text-sky-300">↓ {formatNumber(chat.receivedCount)}</span>
                       </div>
-                              <div className="mt-3 grid gap-2 text-[11px] text-neutral-400 sm:grid-cols-2">
+                              <div className="mt-3 grid gap-2 text-[11px] text-neutral-400 sm:grid-cols-2 lg:grid-cols-3">
                                 <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
                                   <div className="flex items-center gap-1 text-neutral-500">
                                     <GhostIcon className="h-3 w-3 text-rose-200" />
-                                    <span>Ghosting</span>
+                                    <span>Unanswered starts</span>
                           </div>
                           <div className="mt-1 flex items-center gap-2">
-                            <span className="text-emerald-200">You {formatNumber(chat.ghosting.iGhosted)}</span>
+                            <span className="text-emerald-200">
+                              You {formatNumber(chat.unansweredStarters.youLeftThemHanging)}
+                            </span>
                             <span className="text-neutral-600">•</span>
-                            <span className="text-rose-200">Them {formatNumber(chat.ghosting.theyGhostedMe)}</span>
+                            <span className="text-rose-200">
+                              Them {formatNumber(chat.unansweredStarters.theyLeftYouHanging)}
+                            </span>
                           </div>
                         </div>
                         <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
                           <div className="flex items-center gap-1 text-neutral-500">
                             <SparkIcon className="h-3 w-3 text-amber-200" />
-                            <span>Conversation starts</span>
+                            <span>Session starters</span>
                           </div>
                           <div className="mt-1 flex items-center gap-2">
-                            <span className="text-emerald-200">You {formatNumber(chat.conversationInitiation.startedByMe)}</span>
+                            <span className="text-emerald-200">
+                              You {formatNumber(chat.sessionStarters.startedByMe)}
+                            </span>
                             <span className="text-neutral-600">•</span>
-                            <span className="text-sky-200">Them {formatNumber(chat.conversationInitiation.startedByOthers)}</span>
+                            <span className="text-sky-200">
+                              Them {formatNumber(chat.sessionStarters.startedByOthers)}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
+                          <div className="flex items-center gap-1 text-neutral-500">
+                            <DirectChatIcon className="h-3 w-3 text-indigo-200" />
+                            <span>Double texts</span>
+                          </div>
+                          <div className="mt-1 flex items-center gap-2">
+                            <span className="text-emerald-200">
+                              You {formatNumber(chat.doubleTexts.youDoubleTexted)}
+                            </span>
+                            <span className="text-neutral-600">•</span>
+                            <span className="text-indigo-200">
+                              Them {formatNumber(chat.doubleTexts.theyDoubleTexted)}
+                            </span>
                           </div>
                         </div>
                       </div>
                       <div className="mt-3 rounded-lg border border-neutral-900/70 bg-neutral-900/40 p-2.5">
                         <div className="flex items-center gap-1 text-neutral-500">
                           <ClockIcon className="h-3 w-3 text-sky-200" />
-                          <span>Response time</span>
+                          <span>First reply</span>
                         </div>
                         <div className="mt-2 grid gap-3 sm:grid-cols-2">
                           <div>
                             <p className="text-[10px] uppercase tracking-wide text-neutral-500">You</p>
                             <p className="text-sm font-semibold text-emerald-100">
-                              {formatResponseDuration(chatMyResponse.medianSeconds)}
+                              {formatResponseDuration(chatMyFirstReply.medianSeconds)}
                             </p>
                             <p className="text-[11px] text-neutral-500">
-                              90% within {formatResponseDuration(chatMyResponse.p90Seconds)}
+                              90% within {formatResponseDuration(chatMyFirstReply.p90Seconds)}
                             </p>
                             <p className="text-[11px] text-neutral-600">
-                              Fast {formatResponseDuration(chatMyResponse.minSeconds)} · Slow{" "}
-                              {formatResponseDuration(chatMyResponse.maxSeconds)}
+                              Fast {formatResponseDuration(chatMyFirstReply.minSeconds)} · Slow{" "}
+                              {formatResponseDuration(chatMyFirstReply.maxSeconds)}
                             </p>
+                            <p className="text-[11px] text-neutral-600">In-thread median {chatMyInThreadMedian}</p>
                           </div>
                           <div>
                             <p className="text-[10px] uppercase tracking-wide text-neutral-500">Them</p>
                             <p className="text-sm font-semibold text-sky-100">
-                              {formatResponseDuration(chatTheirResponse.medianSeconds)}
+                              {formatResponseDuration(chatTheirFirstReply.medianSeconds)}
                             </p>
                             <p className="text-[11px] text-neutral-500">
-                              90% within {formatResponseDuration(chatTheirResponse.p90Seconds)}
+                              90% within {formatResponseDuration(chatTheirFirstReply.p90Seconds)}
                             </p>
                             <p className="text-[11px] text-neutral-600">
-                              Fast {formatResponseDuration(chatTheirResponse.minSeconds)} · Slow{" "}
-                              {formatResponseDuration(chatTheirResponse.maxSeconds)}
+                              Fast {formatResponseDuration(chatTheirFirstReply.minSeconds)} · Slow{" "}
+                              {formatResponseDuration(chatTheirFirstReply.maxSeconds)}
+                            </p>
+                            <p className="text-[11px] text-neutral-600">
+                              In-thread median {chatTheirInThreadMedian}
                             </p>
                           </div>
                         </div>
@@ -1828,8 +2272,29 @@ export default function Dashboard() {
               </div>
             )}
           </div>
+
+          <MessageSearchPanel
+            rangeStart={statsQueryInput.start}
+            rangeEnd={statsQueryInput.end}
+            topChats={stats?.topChats ?? []}
+          />
         </section>
       </main>
+
+      <PersonDrawer
+        open={Boolean(selectedPersonId)}
+        onClose={() => setSelectedPersonId(null)}
+        person={selectedPerson}
+        messages={selectedMessageStats}
+        calls={selectedCallStats}
+        rangeStartIso={range.startIso}
+        rangeEndIso={range.endIso}
+        callHistoryEarliest={callHistoryEarliest}
+        isMessagesLoading={statsLoading || statsFetching}
+        isCallsLoading={callsQuery.isPending || callsQuery.isFetching}
+        messagesError={statsError}
+        callsError={callsError}
+      />
 
       {reportChat && (
         <div
@@ -1937,7 +2402,6 @@ export default function Dashboard() {
                 <p className="mt-2 text-sm text-sky-100/80">
                   macOS denied access to the Messages database. Open System Settings → Privacy & Security → Full Disk Access and enable Terminal (or the host app), then refresh.
                 </p>
-                <p className="mt-3 text-xs text-sky-100/70">Analysis always stays on-device—no data leaves your Mac.</p>
                 <div className="mt-4 flex gap-2">
                   <button
                     type="button"

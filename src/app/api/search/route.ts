@@ -1,9 +1,21 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { searchMessages } from "@/lib/imessage/queries";
+import type { MessageSearchMode } from "@/lib/imessage/types";
 
 const searchSchema = z.object({
-  q: z.string().min(1, "Query is required"),
+  q: z.string().optional().default(""),
+  mode: z
+    .string()
+    .optional()
+    .transform((value) => (value ? value.toLowerCase() : "smart"))
+    .refine(
+      (value) =>
+        (["smart", "fuzzy", "phrase", "contains", "exact"] as const).includes(value as MessageSearchMode),
+      "mode must be smart, fuzzy, phrase, contains, or exact",
+    )
+    .transform((value) => value as MessageSearchMode),
+  sender: z.string().optional(),
   chatId: z
     .string()
     .optional()
@@ -46,7 +58,16 @@ const searchSchema = z.object({
     .optional()
     .transform((value) => (value ? new Date(value) : undefined))
     .refine((value) => !value || !Number.isNaN(value.getTime()), "Invalid end date"),
-});
+}).refine(
+  (value) =>
+    value.q.trim().length > 0 ||
+    (value.sender?.trim().length ?? 0) > 0 ||
+    value.chatId !== undefined,
+  {
+    message: "Provide a query, sender, or chatId filter",
+    path: ["q"],
+  },
+);
 
 function handleDbError(error: unknown) {
   if (error instanceof Error && /authorization denied/i.test(error.message)) {
@@ -74,11 +95,13 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
   }
 
-  const { q, chatId, limit, offset, fromMe, fromOthers, start, end } = parsed.data;
+  const { q, mode, sender, chatId, limit, offset, fromMe, fromOthers, start, end } = parsed.data;
 
   try {
     const results = searchMessages({
       query: q,
+      mode,
+      sender,
       chatId,
       limit,
       offset,
@@ -90,7 +113,12 @@ export async function GET(request: Request) {
       },
     });
 
-    return NextResponse.json({ data: results });
+    const serialized = results.map((result) => ({
+      ...result,
+      sentAt: result.sentAt?.toISOString() ?? null,
+    }));
+
+    return NextResponse.json({ data: serialized });
   } catch (error) {
     return handleDbError(error);
   }
