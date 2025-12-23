@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { GlobalRangeBar } from "@/components/global-range-bar";
@@ -69,6 +69,16 @@ const compactFormatter = Intl.NumberFormat(undefined, {
 
 function formatNumber(value: number) {
   return value.toLocaleString();
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (!error) return null;
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return fallback;
 }
 
 function formatCompactNumber(value: number | null | undefined) {
@@ -602,6 +612,10 @@ export default function PersonFullscreen() {
   );
 
   const stats = (statsQuery.data as SerializableConversationStats | undefined) ?? null;
+  const statsErrorMessage = useMemo(
+    () => getErrorMessage(statsQuery.error, "Unable to load messages."),
+    [statsQuery.error],
+  );
 
   const calendarRange = useMemo(() => {
     if (!calendarOverrideEnabled) {
@@ -1230,7 +1244,7 @@ export default function PersonFullscreen() {
     entryMap: Map<string, CalendarEntry>,
     maxDailyValue: number,
   ) => {
-    const slots: Array<JSX.Element> = [];
+    const slots: Array<ReactElement> = [];
     const rangeStart = new Date(startDate.getTime());
     const rangeEnd = new Date(endDate.getTime());
     rangeStart.setHours(0, 0, 0, 0);
@@ -2082,7 +2096,7 @@ export default function PersonFullscreen() {
             <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
               <p className="font-semibold text-amber-200">Some data couldn’t load</p>
               <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-amber-100/90">
-                {statsQuery.error ? <li>Messages: {(statsQuery.error as Error).message}</li> : null}
+                {statsErrorMessage ? <li>Messages: {statsErrorMessage}</li> : null}
                 {timelineError ? <li>Timeline: {timelineError}</li> : null}
                 {dailyError ? <li>Calendar: {dailyError}</li> : null}
                 {callsError ? <li>Calls: {callsError}</li> : null}

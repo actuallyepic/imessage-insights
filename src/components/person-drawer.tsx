@@ -11,6 +11,7 @@ import {
   floorToBucket,
   formatBucketKey,
   MessagesTimelineChart,
+  type PersonCallTimelinePoint,
   type PersonCallTimeline,
   type PersonMessageTimeline,
   type PersonTimelineBucket,

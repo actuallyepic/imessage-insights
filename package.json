@@ -12,8 +12,14 @@
     "smoke": "tsx scripts/smoke.ts",
     "electron:dev": "NEXT_DEV_SERVER_URL=http://127.0.0.1:3000 electron .",
     "build:electron": "npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder",
+    "dev:stop": "pm2 stop imessage-next-dev imessage-electron-dev",
+    "dev:restart": "pm2 restart imessage-next-dev imessage-electron-dev",
+    "dev:delete": "pm2 delete imessage-next-dev imessage-electron-dev",
+    "dev:status": "pm2 status imessage-next-dev imessage-electron-dev",
     "dev:logs": "pm2 logs imessage-next-dev imessage-electron-dev",
-    "dev:logs:tmux": "bash scripts/dev-logs-tmux.sh"
+    "dev:logs:tmux": "bash scripts/dev-logs-tmux.sh",
+    "dev:logs:tmux:reset": "bash scripts/dev-logs-tmux.sh reset",
+    "dev:logs:tmux:kill": "bash scripts/dev-logs-tmux.sh kill"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.7",
