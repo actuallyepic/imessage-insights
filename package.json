@@ -4,13 +4,16 @@
   "private": true,
   "main": "electron/main.cjs",
   "scripts": {
-    "dev": "next dev",
+    "dev": "pm2 startOrRestart ecosystem.config.cjs",
+    "next:dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
     "smoke": "tsx scripts/smoke.ts",
     "electron:dev": "NEXT_DEV_SERVER_URL=http://127.0.0.1:3000 electron .",
-    "build:electron": "npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder"
+    "build:electron": "npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder",
+    "dev:logs": "pm2 logs imessage-next-dev imessage-electron-dev",
+    "dev:logs:tmux": "bash scripts/dev-logs-tmux.sh"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.7",
@@ -38,6 +41,7 @@
     "electron-builder": "^24.13.3",
     "eslint": "^9",
     "eslint-config-next": "16.0.1",
+    "pm2": "^5.4.3",
     "tailwindcss": "^4",
     "typescript": "^5"
   },
