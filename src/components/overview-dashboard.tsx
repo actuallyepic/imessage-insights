@@ -605,6 +605,12 @@ export default function OverviewDashboard() {
               >
                 Calls
               </Link>
+              <Link
+                href="/settings"
+                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
+              >
+                Settings
+              </Link>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">

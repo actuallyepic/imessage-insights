@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { getPersonMessageTimeline } from "@/lib/imessage/queries";
+import { getDbErrorInfo } from "@/lib/imessage/db-errors";
 
 const timelineSchema = z.object({
   key: z.string().min(1, "key is required"),
@@ -34,18 +35,13 @@ const timelineSchema = z.object({
 });
 
 function handleDbError(error: unknown) {
-  if (error instanceof Error && /authorization denied/i.test(error.message)) {
-    return NextResponse.json(
-      {
-        error:
-          "macOS denied access to the Messages database. Grant Terminal full disk access and try again.",
-      },
-      { status: 403 },
-    );
+  const info = getDbErrorInfo(error);
+  if (info.kind !== "unknown") {
+    return NextResponse.json({ error: info.message }, { status: info.status });
   }
 
   console.error("Person timeline route error:", error);
-  return NextResponse.json({ error: "Unexpected error while retrieving timeline." }, { status: 500 });
+  return NextResponse.json({ error: info.message }, { status: info.status });
 }
 
 export const runtime = "nodejs";

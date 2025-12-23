@@ -92,6 +92,27 @@ npm run build
 npm start
 ```
 
+## Electron app (no Node required for users)
+
+For a self-contained macOS app that runs locally without Node/Bun:
+
+```bash
+# Terminal 1
+npm run dev
+
+# Terminal 2
+npm run electron:dev
+```
+
+To create a distributable `.app`/`.dmg`:
+
+```bash
+npm run build:electron
+```
+
+The packaged app stores settings in your user data directory and lets you override the Messages database
+path in the Settings screen. Grant Full Disk Access to the app itself so it can read `chat.db`.
+
 ## Extending
 
 - Add new aggregations inside `src/lib/imessage/queries.ts` and surface them via a new API route.

@@ -2,12 +2,15 @@
   "name": "imessage-insights",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "electron:dev": "NEXT_DEV_SERVER_URL=http://127.0.0.1:3000 electron .",
+    "build:electron": "npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.7",
@@ -25,14 +28,34 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.6.0",
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
     "eslint": "^9",
     "eslint-config-next": "16.0.1",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "build": {
+    "appId": "com.imessage.insights",
+    "productName": "iMessage Insights",
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/next",
+        "to": "next"
+      }
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ]
   }
 }

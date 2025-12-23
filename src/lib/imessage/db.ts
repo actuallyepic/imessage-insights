@@ -1,16 +1,7 @@
 import Database, { type Database as BetterSqliteDatabase } from "better-sqlite3";
-import path from "node:path";
-import os from "node:os";
+import { resolveDbPath } from "@/lib/imessage/db-path";
 
 let cachedDb: BetterSqliteDatabase | null = null;
-
-function resolveDbPath(provided?: string): string {
-  if (provided && provided.trim().length > 0) {
-    return path.resolve(provided);
-  }
-
-  return path.join(os.homedir(), "Library", "Messages", "chat.db");
-}
 
 export interface DbOptions {
   dbPath?: string;
@@ -21,7 +12,7 @@ export function getDatabase(options: DbOptions = {}): BetterSqliteDatabase {
     return cachedDb;
   }
 
-  const dbPath = resolveDbPath(options.dbPath ?? process.env.IMESSAGE_DB_PATH);
+  const { path: dbPath } = resolveDbPath(options.dbPath);
 
   cachedDb = new Database(dbPath, {
     readonly: true,
@@ -41,4 +32,3 @@ export function closeDatabase(): void {
     cachedDb = null;
   }
 }
-

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { searchMessages } from "@/lib/imessage/queries";
+import { getDbErrorInfo } from "@/lib/imessage/db-errors";
 import type { MessageSearchMode } from "@/lib/imessage/types";
 
 const searchSchema = z.object({
@@ -70,18 +71,13 @@ const searchSchema = z.object({
 );
 
 function handleDbError(error: unknown) {
-  if (error instanceof Error && /authorization denied/i.test(error.message)) {
-    return NextResponse.json(
-      {
-        error:
-          "macOS denied access to the Messages database. Grant Terminal full disk access and try again.",
-      },
-      { status: 403 },
-    );
+  const info = getDbErrorInfo(error);
+  if (info.kind !== "unknown") {
+    return NextResponse.json({ error: info.message }, { status: info.status });
   }
 
   console.error("Search route error:", error);
-  return NextResponse.json({ error: "Unexpected error querying messages." }, { status: 500 });
+  return NextResponse.json({ error: info.message }, { status: info.status });
 }
 
 export const runtime = "nodejs";

@@ -2,6 +2,7 @@ import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import { getConversationStats } from "@/lib/imessage/queries";
+import { getDbErrorInfo } from "@/lib/imessage/db-errors";
 import { serializeConversationStats } from "@/lib/imessage/serialization";
 import { router, publicProcedure } from "./trpc";
 
@@ -24,18 +25,18 @@ const statsRouter = router({
 
       return serializeConversationStats(stats);
     } catch (error) {
-      if (error instanceof Error && /authorization denied/i.test(error.message)) {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message:
-            "macOS denied access to the Messages database. Grant Terminal full disk access and try again.",
-        });
+      const info = getDbErrorInfo(error);
+      if (info.kind === "permission") {
+        throw new TRPCError({ code: "FORBIDDEN", message: info.message });
+      }
+      if (info.kind === "missing") {
+        throw new TRPCError({ code: "NOT_FOUND", message: info.message });
       }
 
       console.error("Stats router error:", error);
       throw new TRPCError({
         code: "INTERNAL_SERVER_ERROR",
-        message: "Unexpected error while retrieving stats.",
+        message: info.message,
       });
     }
   }),

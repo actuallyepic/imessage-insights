@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getConversationStats } from "@/lib/imessage/queries";
+import { getDbErrorInfo } from "@/lib/imessage/db-errors";
 
 const statsSchema = z.object({
   limit: z
@@ -24,18 +25,13 @@ const statsSchema = z.object({
 });
 
 function handleDbError(error: unknown) {
-  if (error instanceof Error && /authorization denied/i.test(error.message)) {
-    return NextResponse.json(
-      {
-        error:
-          "macOS denied access to the Messages database. Grant Terminal full disk access and try again.",
-      },
-      { status: 403 },
-    );
+  const info = getDbErrorInfo(error);
+  if (info.kind !== "unknown") {
+    return NextResponse.json({ error: info.message }, { status: info.status });
   }
 
   console.error("Stats route error:", error);
-  return NextResponse.json({ error: "Unexpected error while retrieving stats." }, { status: 500 });
+  return NextResponse.json({ error: info.message }, { status: info.status });
 }
 
 export const runtime = "nodejs";
