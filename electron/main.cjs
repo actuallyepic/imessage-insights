@@ -74,7 +74,7 @@ function waitForPort(port, timeoutMs = 20000) {
 
 async function startNextServer() {
   if (isDev) {
-    const devUrl = process.env.NEXT_DEV_SERVER_URL || `http://${host}:3000`;
+    const devUrl = process.env.NEXT_DEV_SERVER_URL || `http://${host}:42123`;
     lastUrl = devUrl;
     return devUrl;
   }

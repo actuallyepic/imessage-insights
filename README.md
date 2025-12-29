@@ -73,7 +73,7 @@ Start the Next.js dev server:
 npm run dev
 ```
 
-Then open [http://localhost:3000](http://localhost:3000) for the overview, with dedicated pages at:
+Then open [http://localhost:42123](http://localhost:42123) for the overview, with dedicated pages at:
 
 - `/messages` – iMessage insights dashboard
 - `/calls` – FaceTime + phone call insights
@@ -109,6 +109,13 @@ To create a distributable `.app`/`.dmg`:
 ```bash
 npm run build:electron
 ```
+
+To install from a release build:
+
+- Download the latest `.dmg` (or `.zip`) from GitHub Releases.
+- Open the DMG and drag **iMessage Insights.app** into `/Applications`.
+- On first launch, right-click → **Open** to bypass Gatekeeper.
+- Grant Full Disk Access to the app so it can read `~/Library/Messages/chat.db`.
 
 The packaged app stores settings in your user data directory and lets you override the Messages database
 path in the Settings screen. Grant Full Disk Access to the app itself so it can read `chat.db`.

@@ -5,12 +5,12 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "pm2 startOrRestart ecosystem.config.cjs",
-    "next:dev": "next dev",
+    "next:dev": "next dev -p 42123",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
     "smoke": "tsx scripts/smoke.ts",
-    "electron:dev": "NEXT_DEV_SERVER_URL=http://127.0.0.1:3000 electron .",
+    "electron:dev": "NEXT_DEV_SERVER_URL=http://127.0.0.1:42123 electron .",
     "build:electron": "npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder",
     "dev:stop": "pm2 stop imessage-next-dev imessage-electron-dev",
     "dev:restart": "pm2 restart imessage-next-dev imessage-electron-dev",
@@ -54,6 +54,9 @@
   "build": {
     "appId": "com.imessage.insights",
     "productName": "iMessage Insights",
+    "mac": {
+      "icon": "electron/assets/icon.icns"
+    },
     "files": [
       "electron/**/*",
       "package.json"
