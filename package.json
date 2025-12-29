@@ -11,7 +11,7 @@
     "lint": "eslint",
     "smoke": "tsx scripts/smoke.ts",
     "electron:dev": "NEXT_DEV_SERVER_URL=http://127.0.0.1:42123 electron .",
-    "build:electron": "npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder",
+    "build:electron": "rm -rf dist electron/next && npm run build && node scripts/prepare-electron.mjs && electron-rebuild -w better-sqlite3 --module-dir electron/next && electron-builder",
     "dev:stop": "pm2 stop imessage-next-dev imessage-electron-dev",
     "dev:restart": "pm2 restart imessage-next-dev imessage-electron-dev",
     "dev:delete": "pm2 delete imessage-next-dev imessage-electron-dev",
