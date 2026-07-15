@@ -3,9 +3,10 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   experimental: {
     mcpServer: true,
-    browserDebugInfoInTerminal: true,
   },
-  /* config options here */
+  logging: {
+    browserToTerminal: true,
+  },
 };
 
 export default nextConfig;

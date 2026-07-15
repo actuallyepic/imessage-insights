@@ -28,7 +28,7 @@ Read-only analytics UI for your local Messages database. Query, visualise, and e
 ## Prerequisites
 
 - macOS host with access to `~/Library/Messages/chat.db`
-- Node.js 18+ (Next.js requirement)
+- Node.js 20.9+ (Next.js 16 requirement)
 - SQLite read permissions (grant Full Disk Access to your shell)
 
 Optional: customise the database location via `.env` (see below).
@@ -77,6 +77,8 @@ Then open [http://localhost:3000](http://localhost:3000) for the overview, with 
 
 - `/messages` – iMessage insights dashboard
 - `/calls` – FaceTime + phone call insights
+- `/people` – people and contact insights
+- `/reports` – shareable conversation reports
 
 The messages dashboard lets you:
 
@@ -103,4 +105,4 @@ npm start
 - Next.js 16 App Router, React 19, and TypeScript
 - Tailwind CSS for styling
 - `better-sqlite3` for performant, synchronous access to the Messages store
-- Bun lockfile checked in for Bun users; npm lockfile for Node/npm flows
+- tRPC + TanStack Query for typed client/server data fetching

@@ -1,8 +1,17 @@
-'use client';
+"use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import {
+  EmptyNote,
+  ErrorBanner,
+  Panel,
+  PanelSubtitle,
+  PanelTitle,
+} from "@/components/ui/primitives";
+import { SearchIcon } from "@/components/ui/icons";
+import { chatLabel, formatDateTime } from "@/lib/format";
 import type { MessageSearchMode, SerializableChatSummary } from "@/lib/imessage/types";
 
 type SearchApiMessage = {
@@ -31,18 +40,8 @@ function useDebouncedValue<T>(value: T, delayMs: number) {
   return debounced;
 }
 
-function formatTimestamp(value: string | null) {
-  if (!value) return "Unknown time";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Unknown time";
-  return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-}
-
 function buildChatLabel(chat: SerializableChatSummary) {
-  const label =
-    chat.chatDisplayName ??
-    (chat.participants.length > 0 ? chat.participants.join(", ") : null) ??
-    `Chat ${chat.chatId}`;
+  const label = chatLabel(chat);
   if (chat.isGroup) return `${label} (group)`;
   return label;
 }
@@ -55,11 +54,49 @@ async function fetchSearchResults(params: Record<string, string>) {
     const message =
       typeof json?.error === "string"
         ? json.error
-        : (json?.error as { message?: string } | undefined)?.message ??
-          "Unable to search messages.";
+        : ((json?.error as { message?: string } | undefined)?.message ?? "Unable to search messages.");
     throw new Error(message);
   }
   return json.data ?? [];
+}
+
+/** Bordered control shell shared by the query box and the selects. */
+const CONTROL =
+  "flex items-center gap-2 rounded-[11px] border border-line-control bg-elevated px-[13px] py-2.5 text-xs";
+
+/** A toggle chip that tints itself when active ("✓ Sent" / "✓ Received"). */
+function FilterChip({
+  active,
+  onToggle,
+  rgb,
+  activeClass,
+  children,
+}: {
+  active: boolean;
+  onToggle: () => void;
+  /** Raw "r,g,b" so the chip can compose its own alpha stops. */
+  rgb: string;
+  activeClass: string;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onToggle}
+      className={`flex cursor-pointer items-center gap-2 rounded-[11px] border px-[13px] py-2.5 text-xs font-semibold transition-colors ${
+        active ? activeClass : "border-line-control bg-elevated text-ink-dim hover:text-ink-secondary"
+      }`}
+      style={
+        active
+          ? { borderColor: `rgba(${rgb},0.4)`, backgroundColor: `rgba(${rgb},0.1)` }
+          : undefined
+      }
+    >
+      <span aria-hidden>{active ? "✓" : "○"}</span>
+      {children}
+    </button>
+  );
 }
 
 export function MessageSearchPanel({
@@ -183,207 +220,195 @@ export function MessageSearchPanel({
   const hasMore = results.length === limit;
 
   return (
-    <section className="rounded-2xl border border-neutral-800/70 bg-neutral-900/40 p-6 shadow-lg shadow-black/30">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <Panel delay={0.46} className="rounded-[20px] px-[22px] py-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold text-white">Search</h2>
-          <p className="mt-1 text-sm text-neutral-400">
-            Filter by sender, sent/received, and match style.
-          </p>
+          <PanelTitle>Search</PanelTitle>
+          <PanelSubtitle>Full-text · filter by sender, chat, and match style</PanelSubtitle>
         </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400">
-          <label className="flex items-center gap-2 rounded-full border border-neutral-800/80 bg-neutral-950/40 px-3 py-1">
-            <span className="text-neutral-500">Range</span>
+        <div className="flex items-center gap-2">
+          <label className={`${CONTROL} text-ink-muted`}>
+            <span>Range</span>
             <select
+              aria-label="Search range"
               value={rangeMode}
               onChange={(event) => setRangeMode(event.target.value as SearchRangeMode)}
-              className="bg-transparent text-neutral-200 outline-none"
+              className="cursor-pointer bg-transparent font-semibold text-ink-secondary outline-none"
             >
               <option value="view">This view</option>
               <option value="all">All time</option>
             </select>
           </label>
+          {searchQuery.isFetching ? (
+            <span className="rounded-[7px] border border-line-control px-2.5 py-[3px] font-mono text-[11px] text-ink-faint">
+              Searching…
+            </span>
+          ) : searchQuery.data ? (
+            <span className="rounded-[7px] border border-line-control px-2.5 py-[3px] font-mono text-[11px] text-ink-faint">
+              {results.length} result{results.length === 1 ? "" : "s"}
+            </span>
+          ) : null}
         </div>
       </div>
 
-      <div className="mt-5 grid gap-3 lg:grid-cols-12">
-        <div className="lg:col-span-6">
-          <label className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
-            Query
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search text…"
-              className="mt-2 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-500/30 transition focus:ring-2"
-            />
-          </label>
+      <div className="mt-3.5 flex flex-wrap gap-2.5">
+        <div className={`${CONTROL} min-w-[200px] flex-1`}>
+          <SearchIcon color="var(--ink-faint)" size={14} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search text…"
+            aria-label="Search query"
+            className="w-full bg-transparent text-[13px] text-ink-secondary outline-none placeholder:text-ink-ghost"
+          />
         </div>
 
-        <div className="lg:col-span-3">
-          <label className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
-            Match
-            <select
-              value={mode}
-              onChange={(event) => setMode(event.target.value as MessageSearchMode)}
-              className="mt-2 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-500/30 transition focus:ring-2"
-            >
-              <option value="smart">Smart</option>
-              <option value="fuzzy">Fuzzy (any word)</option>
-              <option value="phrase">Exact phrase</option>
-              <option value="contains">Contains</option>
-              <option value="exact">Exact message</option>
-            </select>
-          </label>
-        </div>
+        <label className={`${CONTROL} text-ink-muted`}>
+          <span>Match</span>
+          <select
+            aria-label="Match mode"
+            value={mode}
+            onChange={(event) => setMode(event.target.value as MessageSearchMode)}
+            className="cursor-pointer bg-transparent font-semibold text-ink-secondary outline-none"
+          >
+            <option value="smart">Smart</option>
+            <option value="fuzzy">Fuzzy</option>
+            <option value="phrase">Phrase</option>
+            <option value="contains">Contains</option>
+            <option value="exact">Exact</option>
+          </select>
+        </label>
 
-        <div className="lg:col-span-3">
-          <label className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
-            Chat
-            <select
-              value={chatId}
-              onChange={(event) => setChatId(event.target.value)}
-              className="mt-2 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-500/30 transition focus:ring-2"
-            >
-              {chatOptions.map((option) => (
-                <option key={option.value || "all"} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
+        <label className={`${CONTROL} max-w-[220px] text-ink-muted`}>
+          <span>Chat</span>
+          <select
+            aria-label="Chat filter"
+            value={chatId}
+            onChange={(event) => setChatId(event.target.value)}
+            className="min-w-0 cursor-pointer bg-transparent font-semibold text-ink-secondary outline-none"
+          >
+            {chatOptions.map((option) => (
+              <option key={option.value || "all"} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
 
-        <div className="lg:col-span-6">
-          <label className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
-            Sender (received)
-            <input
-              value={sender}
-              onChange={(event) => setSender(event.target.value)}
-              placeholder="Name / number / email…"
-              className="mt-2 w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-500/30 transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={!includeReceived}
-            />
-          </label>
-          <p className="mt-2 text-[11px] text-neutral-500">
-            Matches incoming sender by handle (and display name when available). Turn on “Received” to use this filter.
-          </p>
-        </div>
+        <FilterChip
+          active={includeSent}
+          onToggle={() => setIncludeSent((value) => !value)}
+          rgb="52,211,153"
+          activeClass="text-accent-soft"
+        >
+          Sent
+        </FilterChip>
+        <FilterChip
+          active={includeReceived}
+          onToggle={() => setIncludeReceived((value) => !value)}
+          rgb="56,189,248"
+          activeClass="text-sky-soft"
+        >
+          Received
+        </FilterChip>
+      </div>
 
-        <div className="flex flex-wrap items-end gap-3 lg:col-span-6">
-          <label className="flex items-center gap-2 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200">
-            <input
-              type="checkbox"
-              checked={includeSent}
-              onChange={(event) => setIncludeSent(event.target.checked)}
-              className="h-4 w-4 accent-emerald-400"
-            />
-            Sent
-          </label>
-          <label className="flex items-center gap-2 rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200">
-            <input
-              type="checkbox"
-              checked={includeReceived}
-              onChange={(event) => setIncludeReceived(event.target.checked)}
-              className="h-4 w-4 accent-sky-400"
-            />
-            Received
-          </label>
-
-          <div className="ml-auto flex items-center gap-2 text-xs text-neutral-400">
-            {searchQuery.isFetching ? (
-              <span className="rounded-full border border-neutral-800/70 bg-neutral-950/40 px-3 py-1">
-                Searching…
-              </span>
-            ) : searchQuery.data ? (
-              <span className="rounded-full border border-neutral-800/70 bg-neutral-950/40 px-3 py-1">
-                {results.length} result{results.length === 1 ? "" : "s"}
-              </span>
-            ) : null}
-          </div>
-        </div>
+      <div className="mt-2.5">
+        <input
+          value={sender}
+          onChange={(event) => setSender(event.target.value)}
+          placeholder="Sender — name, number, or email…"
+          aria-label="Sender filter"
+          disabled={!includeReceived}
+          className={`${CONTROL} w-full text-[13px] text-ink-secondary outline-none placeholder:text-ink-ghost disabled:cursor-not-allowed disabled:opacity-60`}
+        />
+        <p className="mt-1.5 text-[11px] text-ink-ghost">
+          Matches incoming senders by handle, and by display name when available. Turn on “Received” to use this
+          filter.
+        </p>
       </div>
 
       {searchQuery.error ? (
-        <div className="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100">
-          {(searchQuery.error as Error).message}
+        <div className="mt-3.5">
+          <ErrorBanner title="Search failed" detail={(searchQuery.error as Error).message} />
         </div>
       ) : null}
 
       {!canSearch ? (
-        <div className="mt-5 rounded-2xl border border-dashed border-neutral-800/80 bg-neutral-950/40 p-6 text-center text-sm text-neutral-400">
-          Add a query, sender, or chat filter to start searching.
+        <div className="mt-3.5 rounded-[13px] border border-dashed border-line-panel bg-inset p-6 text-center">
+          <EmptyNote>Add a query, sender, or chat filter to start searching.</EmptyNote>
         </div>
       ) : (
-        <div className="mt-5 space-y-3">
+        <div className="mt-3.5 flex flex-col gap-2.5">
           {searchQuery.isPending ? (
-            Array.from({ length: 5 }).map((_, index) => (
+            Array.from({ length: 3 }).map((_, index) => (
               <div
                 key={`search-skel-${index}`}
-                className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-4"
+                className="rounded-[13px] border border-line-subtle bg-inset p-[15px]"
               >
-                <div className="h-3 w-56 animate-pulse rounded bg-neutral-800/60" />
-                <div className="mt-2 h-3 w-80 animate-pulse rounded bg-neutral-800/60" />
-                <div className="mt-3 h-3 w-40 animate-pulse rounded bg-neutral-800/60" />
+                <div className="h-3 w-56 animate-pulse rounded bg-track" />
+                <div className="mt-2 h-3 w-80 animate-pulse rounded bg-track" />
+                <div className="mt-3 h-3 w-40 animate-pulse rounded bg-track" />
               </div>
             ))
           ) : results.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-neutral-800/80 bg-neutral-950/40 p-6 text-center text-sm text-neutral-400">
-              No matches.
+            <div className="rounded-[13px] border border-dashed border-line-panel bg-inset p-6 text-center">
+              <EmptyNote>No matches.</EmptyNote>
             </div>
           ) : (
             <>
-              <ul className="space-y-3">
+              <ul className="flex flex-col gap-2.5">
                 {results.map((message) => {
                   const chatLabel =
                     message.chatDisplayName ??
-                    (message.participants.length > 0 ? message.participants.join(", ") : `Chat ${message.chatId}`);
+                    (message.participants.length > 0
+                      ? message.participants.join(", ")
+                      : `Chat ${message.chatId}`);
                   const senderLabel = message.senderDisplayName ?? (message.isFromMe ? "You" : "Unknown");
                   return (
                     <li
                       key={message.messageId}
-                      className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-4"
+                      className="rounded-[13px] border border-line-subtle bg-inset px-[15px] py-[13px]"
                     >
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-400">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="rounded-full border border-neutral-800/80 bg-neutral-950/60 px-2 py-0.5 text-[10px] font-semibold text-neutral-300">
-                            #{message.messageId}
-                          </span>
-                          <span className={message.isFromMe ? "text-emerald-200" : "text-sky-200"}>
-                            {senderLabel}
-                          </span>
-                          <span className="text-neutral-700">•</span>
-                          <span>{formatTimestamp(message.sentAt)}</span>
-                        </div>
-                        {message.senderHandle && !message.isFromMe && (
-                          <span className="truncate text-[11px] text-neutral-500">{message.senderHandle}</span>
-                        )}
+                      <div className="flex flex-wrap items-center gap-2.5 text-[11px]">
+                        <span className="rounded-[5px] border border-line-control px-1.5 py-px font-mono text-ink-ghost">
+                          #{message.messageId}
+                        </span>
+                        <span className={`font-semibold ${message.isFromMe ? "text-accent" : "text-sky"}`}>
+                          {senderLabel}
+                        </span>
+                        <span aria-hidden className="text-ink-ghost">
+                          •
+                        </span>
+                        <span className="text-ink-faint">{formatDateTime(message.sentAt)}</span>
+                        {message.senderHandle && !message.isFromMe ? (
+                          <span className="ml-auto truncate text-ink-ghost">{message.senderHandle}</span>
+                        ) : null}
                       </div>
-                      <p className="mt-2 whitespace-pre-wrap text-sm text-neutral-100">
-                        {message.text ?? <span className="text-neutral-500">(no text)</span>}
+                      <p className="mt-2 whitespace-pre-wrap text-[13px] leading-[1.5] text-ink-secondary">
+                        {message.text ?? <span className="text-ink-ghost">(no text)</span>}
                       </p>
-                      <p className="mt-3 truncate text-[11px] text-neutral-500">{chatLabel}</p>
+                      <p className="mt-2 truncate text-[11px] text-ink-ghost">{chatLabel}</p>
                     </li>
                   );
                 })}
               </ul>
 
-              <div className="mt-4 flex items-center justify-between gap-2">
+              <div className="mt-1.5 flex items-center justify-between gap-2">
                 <button
                   type="button"
                   onClick={() => setPage((value) => Math.max(0, value - 1))}
                   disabled={page === 0 || searchQuery.isFetching}
-                  className="rounded-full border border-neutral-800/80 bg-neutral-900/70 px-4 py-2 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                  className="cursor-pointer rounded-[11px] border border-line-control bg-surface px-4 py-2 text-xs font-semibold text-ink-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Previous
                 </button>
-                <span className="text-xs text-neutral-500">
-                  Page {page + 1}
-                </span>
+                <span className="font-mono text-[11px] text-ink-faint">Page {page + 1}</span>
                 <button
                   type="button"
                   onClick={() => setPage((value) => value + 1)}
                   disabled={!hasMore || searchQuery.isFetching}
-                  className="rounded-full border border-neutral-800/80 bg-neutral-900/70 px-4 py-2 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                  className="cursor-pointer rounded-[11px] border border-line-control bg-surface px-4 py-2 text-xs font-semibold text-ink-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Next
                 </button>
@@ -392,6 +417,6 @@ export function MessageSearchPanel({
           )}
         </div>
       )}
-    </section>
+    </Panel>
   );
 }

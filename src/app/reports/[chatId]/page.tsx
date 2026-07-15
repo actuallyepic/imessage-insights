@@ -1,8 +1,28 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
+
+import { AppShell } from "@/components/app-shell";
 import { ShareReportButton } from "@/components/share-report-button";
-import { getChatSummaryById, getChatTextStyleSummary, type ChatTextStyleSideStats } from "@/lib/imessage/queries";
-import { REACTION_TYPES } from "@/lib/imessage/types";
+import {
+  EmptyNote,
+  ErrorBanner,
+  MeterBar,
+  Panel,
+  PanelLabel,
+  PanelSubtitle,
+  PanelTitle,
+  SplitBar,
+  StatBadge,
+  StatCard,
+} from "@/components/ui/primitives";
+import { chatLabel, formatCount, formatDateTime, formatDayLong, formatPercent, share } from "@/lib/format";
+import {
+  getChatSummaryById,
+  getChatTextStyleSummary,
+  type ChatTextStyleSideStats,
+  type ChatTextStyleSummary,
+} from "@/lib/imessage/queries";
+import { REACTION_TYPES, type ChatSummary, type ReactionType } from "@/lib/imessage/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,147 +33,66 @@ type ReportPageProps = {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 };
 
-const numberFormatter = new Intl.NumberFormat();
-const compactFormatter = new Intl.NumberFormat(undefined, {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
+/* ------------------------------------------------------------------ *
+ * Hero gradient
+ *
+ * The one piece of chrome the shared tokens don't cover: a two-layer
+ * gradient that has to flip with the colour scheme. globals.css belongs to
+ * another owner, so the rule is scoped to this route via a local class.
+ * ------------------------------------------------------------------ */
+
+const HERO_CSS = `
+.report-hero {
+  background:
+    radial-gradient(circle at 30% -20%, rgba(52, 211, 153, 0.22), transparent 55%),
+    linear-gradient(160deg, #0f1512, #0b0b0d);
+}
+@media (prefers-color-scheme: light) {
+  .report-hero {
+    background:
+      radial-gradient(circle at 30% -20%, rgba(52, 211, 153, 0.16), transparent 55%),
+      linear-gradient(160deg, #eafaf1, #ffffff);
+  }
+}
+`;
+
+/* ------------------------------------------------------------------ *
+ * Local helpers
+ * ------------------------------------------------------------------ */
+
+/** The design's internal reaction keys mapped to the labels it renders. */
+const REACTION_LABELS: Record<ReactionType, string> = {
+  love: "Loved",
+  like: "Liked",
+  laugh: "Laughed",
+  emphasize: "Emphasized",
+  question: "Questioned",
+  dislike: "Disliked",
+};
 
 function parseDateParam(value?: string | string[]) {
   const raw = Array.isArray(value) ? value[0] : value;
   if (!raw) return undefined;
   const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) {
-    return undefined;
-  }
-  return parsed;
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
-function formatNumber(value: number) {
-  return numberFormatter.format(value);
-}
-
-function formatCompact(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "—";
-  return compactFormatter.format(value);
-}
-
-function formatPercent(part: number, total: number) {
-  if (!total || !Number.isFinite(part)) return "—";
-  return `${((part / total) * 100).toFixed(1)}%`;
+/** A metric that may legitimately be absent — never invent a zero for it. */
+function formatMetric(value: number | null | undefined, digits = 1) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return digits === 0 ? Math.round(value).toString() : value.toFixed(digits);
 }
 
 function formatRate(value: number | null | undefined, digits = 0) {
-  if (!Number.isFinite(value ?? NaN)) return "—";
-  const percent = (value as number) * 100;
-  return `${percent.toFixed(digits)}%`;
-}
-
-function formatMetric(value: number | null | undefined, digits = 1) {
-  if (!Number.isFinite(value ?? NaN)) return "—";
-  const numeric = value as number;
-  return digits === 0 ? Math.round(numeric).toString() : numeric.toFixed(digits);
-}
-
-function ToneBar({ stats }: { stats: ChatTextStyleSideStats }) {
-  const total = stats.tone.positive + stats.tone.neutral + stats.tone.negative;
-  if (!total) {
-    return <p className="mt-2 text-xs text-neutral-500">No tone sample.</p>;
-  }
-
-  const positiveRate = stats.tone.positive / total;
-  const neutralRate = stats.tone.neutral / total;
-  const negativeRate = stats.tone.negative / total;
-
-  return (
-    <div className="mt-2">
-      <div className="flex h-2 overflow-hidden rounded-full bg-neutral-800/70">
-        <div className="h-full bg-emerald-400/80" style={{ width: `${positiveRate * 100}%` }} />
-        <div className="h-full bg-neutral-500/70" style={{ width: `${neutralRate * 100}%` }} />
-        <div className="h-full bg-rose-400/80" style={{ width: `${negativeRate * 100}%` }} />
-      </div>
-      <div className="mt-2 flex flex-wrap justify-between gap-2 text-[11px] text-neutral-400">
-        <span>
-          + {formatRate(positiveRate)} · ○ {formatRate(neutralRate)} · − {formatRate(negativeRate)}
-        </span>
-        <span className="text-neutral-500">avg {formatMetric(stats.tone.averageScore, 2)}</span>
-      </div>
-    </div>
-  );
-}
-
-function StyleCard({ title, stats }: { title: string; stats: ChatTextStyleSideStats }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-neutral-950/20 p-5">
-      <div className="flex items-baseline justify-between gap-3">
-        <p className="text-sm font-semibold text-neutral-100">{title}</p>
-        <span className="text-xs text-neutral-500">{formatNumber(stats.messageCount)} msgs</span>
-      </div>
-
-      <div className="mt-4 grid gap-3 text-sm text-neutral-200">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-neutral-400">Median length</span>
-          <span className="font-semibold text-white">
-            {stats.medianChars ? `${formatMetric(stats.medianChars, 0)} chars` : "—"}
-          </span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-neutral-400">P90 length</span>
-          <span className="font-semibold text-white">
-            {stats.p90Chars ? `${formatMetric(stats.p90Chars, 0)} chars` : "—"}
-          </span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-neutral-400">Emoji density</span>
-          <span className="font-semibold text-white">{formatMetric(stats.emojiPerMessage, 2)} / msg</span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-neutral-400">Multi-line</span>
-          <span className="font-semibold text-white">{formatRate(stats.multiLineRate)}</span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-neutral-400">Split-up streaks</span>
-          <span className="font-semibold text-white">
-            {formatMetric(stats.avgRunLength, 2)} avg · {formatRate(stats.multiMessageRunRate)}
-          </span>
-        </div>
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-neutral-400">Affirmative starts</span>
-          <span className="font-semibold text-white">{formatRate(stats.affirmativeRate)}</span>
-        </div>
-      </div>
-
-      <div className="mt-5 border-t border-white/10 pt-4">
-        <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Tone</p>
-        <ToneBar stats={stats} />
-      </div>
-    </div>
-  );
-}
-
-function formatDateTime(value: Date | null) {
-  if (!value) return "No activity in this window";
-  return value.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return formatPercent(value, digits);
 }
 
 function formatRangeLabel(start?: Date, end?: Date) {
-  if (start && end) {
-    const startLabel = start.toLocaleDateString(undefined, { dateStyle: "medium" });
-    const endLabel = end.toLocaleDateString(undefined, { dateStyle: "medium" });
-    return `${startLabel} → ${endLabel}`;
-  }
-  if (start) {
-    return `Since ${start.toLocaleDateString(undefined, { dateStyle: "medium" })}`;
-  }
-  if (end) {
-    return `Up to ${end.toLocaleDateString(undefined, { dateStyle: "medium" })}`;
-  }
+  if (start && end) return `${formatDayLong(start)} → ${formatDayLong(end)}`;
+  if (start) return `Since ${formatDayLong(start)}`;
+  if (end) return `Up to ${formatDayLong(end)}`;
   return "All-time overview";
-}
-
-function formatParticipantName(name: string | null | undefined) {
-  if (!name) return "Unknown";
-  return name;
 }
 
 function buildShareFileName(title: string) {
@@ -162,9 +101,311 @@ function buildShareFileName(title: string) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
-
-  return `${safe || "group-report"}-report.png`;
+  return `${safe || "chat"}-report.png`;
 }
+
+/** Calendar days spanned by the chat's own first/last message — the honest
+ *  denominator for a per-day rate. Null when the window has no activity. */
+function activeSpanDays(summary: ChatSummary): number | null {
+  const { firstMessageAt, lastMessageAt } = summary;
+  if (!firstMessageAt || !lastMessageAt) return null;
+  const ms = lastMessageAt.getTime() - firstMessageAt.getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  return Math.max(1, Math.round(ms / 86_400_000) + 1);
+}
+
+function isAuthorizationError(error: unknown) {
+  return error instanceof Error && /authorization denied/i.test(error.message);
+}
+
+/* ------------------------------------------------------------------ *
+ * Chips
+ * ------------------------------------------------------------------ */
+
+function Chip({ children, muted = false }: { children: React.ReactNode; muted?: boolean }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border border-line bg-surface px-3 py-1 text-[11px] font-medium ${
+        muted ? "text-ink-faint" : "text-ink-tertiary"
+      }`}
+    >
+      {children}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Tone & style
+ * ------------------------------------------------------------------ */
+
+function ToneSection({ stats }: { stats: ChatTextStyleSideStats }) {
+  const { positive, neutral, negative, averageScore } = stats.tone;
+  const total = positive + neutral + negative;
+
+  if (total === 0) {
+    return (
+      <div className="mt-4 border-t border-line-hairline pt-4">
+        <PanelLabel>Tone</PanelLabel>
+        <EmptyNote className="mt-2">No tone sample in this range.</EmptyNote>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 border-t border-line-hairline pt-4">
+      <PanelLabel>Tone</PanelLabel>
+      <SplitBar
+        className="mt-2.5"
+        height={8}
+        segments={[
+          { value: positive, color: "var(--accent)" },
+          { value: neutral, color: "var(--ink-ghost)" },
+          { value: negative, color: "var(--rose)" },
+        ]}
+      />
+      <p className="mt-2.5 font-mono text-[10px] text-ink-faint">
+        + {formatRate(positive / total)} · ○ {formatRate(neutral / total)} · − {formatRate(negative / total)} · avg{" "}
+        {formatMetric(averageScore, 2)}
+      </p>
+    </div>
+  );
+}
+
+function StyleRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-xs text-ink-muted">{label}</span>
+      <span className="text-xs font-semibold text-ink-secondary">{value}</span>
+    </div>
+  );
+}
+
+function StyleCard({ title, stats, delay }: { title: string; stats: ChatTextStyleSideStats; delay: number }) {
+  return (
+    <div className="rounded-[14px] border border-line-hairline bg-inset p-[17px] animate-rise" style={{ animationDelay: `${delay}s` }}>
+      <div className="flex items-baseline justify-between gap-3">
+        <PanelTitle>{title}</PanelTitle>
+        <span className="text-[11px] text-ink-faint">{formatCount(stats.messageCount)} msgs</span>
+      </div>
+
+      <div className="mt-4 grid gap-2.5">
+        <StyleRow
+          label="Median length"
+          value={stats.medianChars === null ? "—" : `${formatMetric(stats.medianChars, 0)} chars`}
+        />
+        <StyleRow label="P90 length" value={stats.p90Chars === null ? "—" : `${formatMetric(stats.p90Chars, 0)} chars`} />
+        <StyleRow
+          label="Emoji density"
+          value={stats.emojiPerMessage === null ? "—" : `${formatMetric(stats.emojiPerMessage, 2)} / msg`}
+        />
+        <StyleRow label="Multi-line" value={formatRate(stats.multiLineRate)} />
+        <StyleRow label="Affirmative starts" value={formatRate(stats.affirmativeRate)} />
+      </div>
+
+      <ToneSection stats={stats} />
+    </div>
+  );
+}
+
+function ToneAndStyle({ style }: { style: ChatTextStyleSummary }) {
+  return (
+    <Panel delay={0.16} className="rounded-[18px] p-[18px]">
+      <PanelLabel>Tone &amp; style</PanelLabel>
+      <PanelSubtitle>
+        Based on {formatCount(style.totalMessagesAnalyzed)} text messages in this chat.
+      </PanelSubtitle>
+      <div className="mt-4 grid gap-3.5 lg:grid-cols-2">
+        <StyleCard title="You" stats={style.me} delay={0.2} />
+        <StyleCard title="Others" stats={style.others} delay={0.24} />
+      </div>
+    </Panel>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Ranked lists
+ * ------------------------------------------------------------------ */
+
+function TopContributors({ summary }: { summary: ChatSummary }) {
+  const rows = summary.messageParticipants.slice(0, 10);
+  // Bars are indexed to the leader, so the ranking reads as a shape.
+  const peak = rows.reduce((max, row) => Math.max(max, row.messageCount), 0);
+
+  return (
+    <Panel delay={0.28} className="rounded-[18px] p-[18px]">
+      <div className="flex items-center justify-between gap-3">
+        <PanelLabel>Top contributors</PanelLabel>
+        <span className="text-[11px] text-ink-faint">Message volume</span>
+      </div>
+
+      {rows.length === 0 ? (
+        <EmptyNote className="mt-4">No messages in this range.</EmptyNote>
+      ) : (
+        <ul className="mt-4 flex flex-col gap-3.5">
+          {rows.map((row, index) => (
+            <li key={row.id ?? `${index}-${row.displayName}`} className="flex flex-col gap-1.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="font-mono text-[10px] text-ink-ghost">{index + 1}</span>
+                  <span
+                    className={`truncate text-xs ${row.isMe ? "font-semibold text-accent" : "font-medium text-ink-secondary"}`}
+                  >
+                    {row.displayName ?? "Unknown"}
+                  </span>
+                </div>
+                <span className="flex-none text-xs font-semibold text-ink">{formatCount(row.messageCount)}</span>
+              </div>
+              <MeterBar
+                ratio={peak > 0 ? row.messageCount / peak : 0}
+                color="var(--accent)"
+                delay={0.3 + index * 0.04}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+function ReactionTypes({ summary }: { summary: ChatSummary }) {
+  // Ranked, so the bars read top-to-bottom longest-to-shortest.
+  const rows = REACTION_TYPES.map((type) => ({
+    type,
+    label: REACTION_LABELS[type],
+    reactionCount: summary.reactions.byType[type].reactionCount,
+  }))
+    .filter((row) => row.reactionCount > 0)
+    .sort((a, b) => b.reactionCount - a.reactionCount || a.label.localeCompare(b.label));
+
+  const peak = rows.reduce((max, row) => Math.max(max, row.reactionCount), 0);
+
+  return (
+    <Panel delay={0.32} className="rounded-[18px] p-[18px]">
+      <div className="flex items-center justify-between gap-3">
+        <PanelLabel>Reaction types</PanelLabel>
+        <span className="text-[11px] text-ink-faint">Tapbacks</span>
+      </div>
+
+      {rows.length === 0 ? (
+        <EmptyNote className="mt-4">No tapbacks in this range.</EmptyNote>
+      ) : (
+        <ul className="mt-4 flex flex-col gap-3.5">
+          {rows.map((row, index) => (
+            <li key={row.type} className="flex flex-col gap-1.5">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-medium text-ink-secondary">{row.label}</span>
+                <span className="text-xs font-semibold text-ink">{formatCount(row.reactionCount)}</span>
+              </div>
+              <MeterBar
+                ratio={peak > 0 ? row.reactionCount / peak : 0}
+                color="var(--fuchsia)"
+                delay={0.34 + index * 0.04}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Quick stats
+ * ------------------------------------------------------------------ */
+
+function QuickStat({
+  label,
+  value,
+  footer,
+  delay,
+}: {
+  label: string;
+  value: string;
+  footer: string;
+  delay: number;
+}) {
+  return (
+    <div
+      className="rounded-[14px] border border-line-hairline bg-inset p-[17px] animate-rise"
+      style={{ animationDelay: `${delay}s` }}
+    >
+      <PanelLabel>{label}</PanelLabel>
+      <p className="mt-2.5 text-[22px] font-semibold tracking-[-0.02em] text-ink">{value}</p>
+      <p className="mt-1 text-[11px] text-ink-faint">{footer}</p>
+    </div>
+  );
+}
+
+function QuickStats({ summary }: { summary: ChatSummary }) {
+  const contributors = summary.messageParticipants.length;
+  const spanDays = activeSpanDays(summary);
+  const totalMessages = summary.messageCount;
+  const totalReactions = summary.reactions.reactionCount;
+
+  return (
+    <Panel delay={0.36} className="rounded-[18px] p-[18px]">
+      <PanelLabel>Quick stats</PanelLabel>
+      <PanelSubtitle>Derived from this chat&apos;s own activity window.</PanelSubtitle>
+
+      <div className="mt-4 grid gap-3.5 md:grid-cols-3">
+        <QuickStat
+          label="Avg per member"
+          value={contributors > 0 ? formatCount(Math.round(totalMessages / contributors)) : "—"}
+          footer={
+            contributors > 0
+              ? `Across ${formatCount(contributors)} who sent messages`
+              : "No senders in this range"
+          }
+          delay={0.4}
+        />
+        <QuickStat
+          label="Sent per day"
+          value={spanDays === null ? "—" : formatMetric(summary.sentCount / spanDays, 1)}
+          footer={
+            spanDays === null
+              ? "No activity in this range"
+              : `Over ${formatCount(spanDays)} ${spanDays === 1 ? "day" : "days"} of activity`
+          }
+          delay={0.44}
+        />
+        <QuickStat
+          label="Reactions per 100 msgs"
+          value={totalMessages > 0 ? formatMetric((totalReactions / totalMessages) * 100, 1) : "—"}
+          footer="Engagement via tapbacks"
+          delay={0.48}
+        />
+      </div>
+    </Panel>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Shell states
+ * ------------------------------------------------------------------ */
+
+function ReportShell({ children }: { children: React.ReactNode }) {
+  return (
+    <AppShell>
+      <div className="flex flex-col gap-[22px]">{children}</div>
+    </AppShell>
+  );
+}
+
+function BackToReports() {
+  return (
+    <Link
+      href="/reports"
+      className="inline-flex w-fit items-center gap-2 rounded-full border border-line-control bg-surface px-4 py-1.5 text-xs font-semibold text-ink-secondary transition-colors hover:bg-surface-hover hover:text-ink"
+    >
+      ← All reports
+    </Link>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Page
+ * ------------------------------------------------------------------ */
 
 export default async function ReportPage({ params, searchParams }: ReportPageProps) {
   const resolvedParams = await params;
@@ -175,297 +416,153 @@ export default async function ReportPage({ params, searchParams }: ReportPagePro
     notFound();
   }
 
+  // This route keeps its own raw ?start/?end contract — it predates the
+  // app-wide rm/r/tz scheme and shared links depend on these exact params.
   const start = parseDateParam(queryParams.start);
   const end = parseDateParam(queryParams.end);
-  const summary = getChatSummaryById(chatId, {
-    dateRange: { start, end },
-  });
-  const style = getChatTextStyleSummary(chatId, {
-    dateRange: { start, end },
-  });
+
+  let summary: ChatSummary | null;
+  let style: ChatTextStyleSummary | null;
+  try {
+    summary = getChatSummaryById(chatId, { dateRange: { start, end } });
+    style = getChatTextStyleSummary(chatId, { dateRange: { start, end } });
+  } catch (error) {
+    if (isAuthorizationError(error)) {
+      return (
+        <ReportShell>
+          <ErrorBanner
+            title="macOS denied access to the Messages database"
+            detail="Grant Terminal full disk access in System Settings › Privacy & Security, then reload this page."
+          />
+          <BackToReports />
+        </ReportShell>
+      );
+    }
+    throw error;
+  }
 
   if (!summary) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-neutral-950 px-6 text-center text-neutral-100">
-        <div className="max-w-md space-y-4 rounded-2xl border border-neutral-800/80 bg-neutral-900/70 p-8">
-          <p className="text-sm font-semibold uppercase tracking-[0.3em] text-emerald-300">Group report</p>
-          <h1 className="text-2xl font-semibold text-white">Chat unavailable</h1>
-          <p className="text-sm text-neutral-400">
-            We couldn&apos;t find any messages for this chat. Make sure you shared the correct link and try again.
+      <ReportShell>
+        <Panel className="rounded-[18px] p-[18px]">
+          <PanelLabel>Report</PanelLabel>
+          <p className="mt-2 text-lg font-semibold text-ink">Chat unavailable</p>
+          <p className="mt-1.5 text-[13px] text-ink-dim">
+            No messages were found for this chat in the selected range. Check the link, or widen the range.
           </p>
-          <Link
-            href="/messages"
-            className="inline-flex items-center justify-center rounded-full border border-emerald-400/50 px-4 py-1.5 text-sm font-semibold text-emerald-200 transition hover:border-emerald-300 hover:text-white"
-          >
-            Back to messages
-          </Link>
-        </div>
-      </main>
+          <div className="mt-4">
+            <BackToReports />
+          </div>
+        </Panel>
+      </ReportShell>
     );
   }
 
-  const title = summary.chatDisplayName ?? "Messages report";
-  const memberCount = summary.participants.length;
-  const memberLabel =
-    memberCount === 0 ? "No members detected" : `${memberCount} ${memberCount === 1 ? "member" : "members"}`;
-  const lastActiveLabel = formatDateTime(summary.lastMessageAt);
-  const rangeLabel = formatRangeLabel(start, end);
-  const generatedAt = new Date().toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  const topMembers = summary.messageParticipants.slice(0, 10);
-  const topReactors = summary.reactionParticipants.slice(0, 10);
+  const title = chatLabel(summary);
+  const eyebrow = summary.isGroup ? "Group report" : "Direct report";
+  // `participants` is the roster minus you, but you are a member of your own chat.
+  const memberCount = summary.participants.length + 1;
   const totalMessages = summary.messageCount;
   const totalReactions = summary.reactions.reactionCount;
-  const reactionTypeEntries = REACTION_TYPES.map((type) => ({
-    type,
-    ...summary.reactions.byType[type],
-  })).filter((entry) => entry.reactionCount > 0);
 
-  const participantChips = summary.participants.slice(0, 12);
-  const remainingParticipants = Math.max(0, summary.participants.length - participantChips.length);
+  // Prefer messageParticipants: it carries resolved names, where `participants`
+  // is raw handles unless macOS Contacts matched them.
+  const otherNames = summary.messageParticipants
+    .filter((p) => p.isMe !== true && p.displayName?.trim() && p.displayName !== "You")
+    .map((p) => p.displayName!.trim());
+  const allNames = ["You", ...(otherNames.length > 0 ? otherNames : summary.participants)];
 
-  const statCards = [
-    {
-      label: "Messages",
-      value: formatNumber(totalMessages),
-      accent: "Total volume",
-      tone: "emerald",
-    },
-    {
-      label: "Sent",
-      value: formatNumber(summary.sentCount),
-      accent: formatPercent(summary.sentCount, totalMessages),
-      tone: "sky",
-    },
-    {
-      label: "Received",
-      value: formatNumber(summary.receivedCount),
-      accent: formatPercent(summary.receivedCount, totalMessages),
-      tone: "violet",
-    },
-    {
-      label: "Reactions",
-      value: formatNumber(totalReactions),
-      accent: formatPercent(totalReactions, totalMessages),
-      tone: "fuchsia",
-    },
-  ] as const;
-
-  const shareFileName = buildShareFileName(title);
+  const participantChips = allNames.slice(0, 12);
+  const remainingParticipants = Math.max(0, allNames.length - participantChips.length);
 
   return (
-    <div id="report-capture" className="min-h-screen bg-neutral-950 text-neutral-50">
-      <header className="relative overflow-hidden border-b border-neutral-900/80 bg-gradient-to-br from-emerald-600/15 via-neutral-950 to-neutral-950">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(16,185,129,0.18),_transparent_55%)]" />
-        <div className="relative mx-auto max-w-5xl px-6 py-12">
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <p className="text-xs font-semibold uppercase tracking-[0.4em] text-emerald-300">Group report</p>
-            <ShareReportButton targetId="report-capture" fileName={shareFileName} />
+    <AppShell>
+      <style dangerouslySetInnerHTML={{ __html: HERO_CSS }} />
+
+      {/* Full-bleed inside the shell: cancel main's padding on the capture
+          wrapper, then re-pad the sections under the hero. Keeping the
+          negative margin on #report-capture (rather than on the header)
+          means the exported PNG spans the full width too. */}
+      <div id="report-capture" className="-mx-6 -mt-[30px] flex flex-col bg-page lg:-mx-[34px]">
+        <header className="report-hero border-b border-line-subtle px-6 pt-[34px] pb-9 lg:px-[34px]">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-accent">{eyebrow}</p>
+            <ShareReportButton targetId="report-capture" fileName={buildShareFileName(title)} />
           </div>
-          <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white">{title}</h1>
-          <div className="mt-4 flex flex-wrap gap-3 text-xs font-semibold uppercase tracking-wide text-neutral-300">
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1">
-              {memberLabel}
-            </span>
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-neutral-300">
-              {rangeLabel}
-            </span>
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-neutral-300">
-              Last active · {lastActiveLabel}
-            </span>
+
+          <h1 className="mt-3 text-[34px] font-semibold leading-tight tracking-[-0.02em] text-ink">{title}</h1>
+
+          <div className="mt-4 flex flex-wrap gap-2">
+            {summary.isGroup && memberCount > 0 ? (
+              <Chip>
+                {formatCount(memberCount)} {memberCount === 1 ? "member" : "members"}
+              </Chip>
+            ) : null}
+            <Chip>{formatRangeLabel(start, end)}</Chip>
+            <Chip muted>
+              {summary.lastMessageAt
+                ? `Last active · ${formatDateTime(summary.lastMessageAt)}`
+                : "No activity in this range"}
+            </Chip>
           </div>
-          {participantChips.length > 0 && (
-            <div className="mt-6 flex flex-wrap gap-2">
+
+          {participantChips.length > 0 ? (
+            <div className="mt-5 flex flex-wrap gap-2">
               {participantChips.map((name, index) => (
-                <span
-                  key={`${name}-${index}`}
-                  className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-neutral-200"
-                >
-                  {name}
-                </span>
+                <Chip key={`${name}-${index}`}>{name}</Chip>
               ))}
-              {remainingParticipants > 0 && (
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-neutral-400">
-                  +{remainingParticipants} more
-                </span>
-              )}
+              {remainingParticipants > 0 ? <Chip muted>+{remainingParticipants} more</Chip> : null}
             </div>
-          )}
-        </div>
-      </header>
+          ) : null}
+        </header>
 
-      <main className="mx-auto max-w-5xl space-y-8 px-6 py-10">
-        <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {statCards.map((card) => {
-            const toneClasses: Record<string, string> = {
-              emerald: "from-emerald-500/20 via-emerald-500/5 to-transparent border-emerald-500/30",
-              sky: "from-sky-500/20 via-sky-500/5 to-transparent border-sky-500/30",
-              violet: "from-violet-500/20 via-violet-500/5 to-transparent border-violet-500/30",
-              fuchsia: "from-fuchsia-500/20 via-fuchsia-500/5 to-transparent border-fuchsia-500/30",
-            };
-            return (
-              <div
-                key={card.label}
-                className={`rounded-2xl border bg-gradient-to-b p-5 shadow-lg shadow-black/30 ${toneClasses[card.tone]}`}
-              >
-                <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">{card.label}</p>
-                <p className="mt-3 text-3xl font-semibold text-white">{card.value}</p>
-                <p className="text-sm text-neutral-300">{card.accent}</p>
-              </div>
-            );
-          })}
-        </section>
-
-        {style && style.totalMessagesAnalyzed > 0 && (
-          <section className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Tone &amp; style</p>
-                <p className="mt-1 text-sm text-neutral-400">
-                  Based on {formatNumber(style.totalMessagesAnalyzed)} text messages in this chat.
-                </p>
-              </div>
-            </div>
-            <div className="mt-5 grid gap-4 lg:grid-cols-2">
-              <StyleCard title="You" stats={style.me} />
-              <StyleCard title="Others" stats={style.others} />
-            </div>
+        <div className="flex flex-col gap-[22px] px-6 pt-[22px] lg:px-[34px]">
+          <section className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard label="Messages" value={formatCount(totalMessages)} tint="accent" delay={0} />
+            <StatCard
+              label="Sent"
+              value={formatCount(summary.sentCount)}
+              badge={<StatBadge tint="sky">{formatPercent(share(summary.sentCount, totalMessages), 1)}</StatBadge>}
+              tint="sky"
+              delay={0.04}
+            />
+            <StatCard
+              label="Received"
+              value={formatCount(summary.receivedCount)}
+              badge={
+                <StatBadge tint="violet">{formatPercent(share(summary.receivedCount, totalMessages), 1)}</StatBadge>
+              }
+              tint="violet"
+              delay={0.08}
+            />
+            <StatCard
+              label="Reactions"
+              value={formatCount(totalReactions)}
+              badge={<StatBadge tint="fuchsia">{formatPercent(share(totalReactions, totalMessages), 1)}</StatBadge>}
+              tint="fuchsia"
+              delay={0.12}
+            />
           </section>
-        )}
 
-        <section className="grid gap-6 lg:grid-cols-2">
-          <div className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Top contributors</p>
-              <span className="text-xs text-neutral-500">Message volume</span>
-            </div>
-            <ul className="mt-4 space-y-3">
-              {topMembers.length === 0 ? (
-                <li className="text-sm text-neutral-400">No messages during this window.</li>
-              ) : (
-                topMembers.map((member, index) => {
-                  const share = totalMessages > 0 ? (member.messageCount / totalMessages) * 100 : 0;
-                  return (
-                    <li key={member.id ?? `${index}-${member.displayName}`} className="space-y-1">
-                      <div className="flex items-center justify-between text-sm">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-neutral-500">#{index + 1}</span>
-                          <span className={member.isMe ? "font-semibold text-emerald-200" : "text-neutral-100"}>
-                            {formatParticipantName(member.displayName)}
-                          </span>
-                        </div>
-                        <span className="font-semibold text-neutral-50">{formatNumber(member.messageCount)}</span>
-                      </div>
-                      <div className="h-1.5 rounded-full bg-neutral-800">
-                        <div
-                          className="h-full rounded-full bg-emerald-400/80"
-                          style={{ width: `${Math.max(4, share)}%` }}
-                        />
-                      </div>
-                    </li>
-                  );
-                })
-              )}
-            </ul>
-          </div>
+          {style && style.totalMessagesAnalyzed > 0 ? <ToneAndStyle style={style} /> : null}
 
-          <div className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Top reactors</p>
-              <span className="text-xs text-neutral-500">Tapbacks sent</span>
-            </div>
-            <ul className="mt-4 space-y-3">
-              {topReactors.length === 0 ? (
-                <li className="text-sm text-neutral-400">No reactions recorded.</li>
-              ) : (
-                topReactors.map((reactor, index) => (
-                  <li key={reactor.id ?? `${index}-${reactor.displayName}`} className="flex items-center justify-between text-sm">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-neutral-500">#{index + 1}</span>
-                      <span className={reactor.isMe ? "font-semibold text-emerald-200" : "text-neutral-100"}>
-                        {formatParticipantName(reactor.displayName)}
-                      </span>
-                    </div>
-                    <span className="font-semibold text-neutral-50">{formatNumber(reactor.reactionCount)}</span>
-                  </li>
-                ))
-              )}
-            </ul>
-            <div className="mt-4 rounded-xl border border-white/10 bg-neutral-950/40 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Reaction types</p>
-              {reactionTypeEntries.length === 0 ? (
-                <p className="mt-3 text-sm text-neutral-400">No tapbacks detected.</p>
-              ) : (
-                <div className="mt-3 space-y-3">
-                  {reactionTypeEntries.map(({ type, reactionCount }) => {
-                    const share = totalReactions > 0 ? (reactionCount / totalReactions) * 100 : 0;
-                    return (
-                      <div key={type}>
-                        <div className="flex items-center justify-between text-sm text-neutral-300">
-                          <span className="capitalize">{type}</span>
-                          <span className="font-semibold text-neutral-50">{formatNumber(reactionCount)}</span>
-                        </div>
-                        <div className="mt-1 h-1.5 rounded-full bg-neutral-800">
-                          <div
-                            className="h-full rounded-full bg-fuchsia-400/80"
-                            style={{ width: `${Math.max(3, share)}%` }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
-        </section>
+          <section className="grid gap-3.5 lg:grid-cols-2">
+            <TopContributors summary={summary} />
+            <ReactionTypes summary={summary} />
+          </section>
 
-        <section className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Quick stats</p>
-              <p className="text-sm text-neutral-300">Snapshot for this chat.</p>
-            </div>
-            <Link
-              href="/messages"
-              className="inline-flex items-center gap-2 rounded-full border border-white/20 px-4 py-1.5 text-sm font-semibold text-neutral-100 transition hover:border-emerald-400/60 hover:text-emerald-100"
-            >
-              Back to messages
-              <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
-                <path
-                  fill="currentColor"
-                  d="M5 12a1 1 0 0 1 1-1h10.586l-4.293-4.293a1 1 0 0 1 1.414-1.414l6 6a1 1 0 0 1 0 1.414l-6 6a1 1 0 0 1-1.414-1.414L16.586 13H6a1 1 0 0 1-1-1"
-                />
-              </svg>
-            </Link>
-          </div>
-          <div className="mt-6 grid gap-4 md:grid-cols-3">
-            <div className="rounded-xl border border-white/10 bg-neutral-950/40 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Average per member</p>
-              <p className="mt-2 text-2xl font-semibold text-white">
-                {memberCount ? formatNumber(Math.round(totalMessages / memberCount)) : "—"}
-              </p>
-              <p className="text-sm text-neutral-400">Messages across participants</p>
-            </div>
-            <div className="rounded-xl border border-white/10 bg-neutral-950/40 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Sent per day</p>
-              <p className="mt-2 text-2xl font-semibold text-white">{formatCompact(summary.sentCount / 7)}</p>
-              <p className="text-sm text-neutral-400">Approximate weekly cadence</p>
-            </div>
-            <div className="rounded-xl border border-white/10 bg-neutral-950/40 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Reactions per 100 msgs</p>
-              <p className="mt-2 text-2xl font-semibold text-white">
-                {totalMessages ? ((totalReactions / totalMessages) * 100).toFixed(1) : "0.0"}
-              </p>
-              <p className="text-sm text-neutral-400">Engagement via tapbacks</p>
-            </div>
-          </div>
-        </section>
+          <QuickStats summary={summary} />
 
-        <footer className="rounded-2xl border border-white/10 bg-neutral-900/50 p-5 text-sm text-neutral-400">
-          <p>Generated {generatedAt}. Refresh this page anytime to pull the latest stats.</p>
-          <p className="text-xs text-neutral-500">All analysis happens locally on your Mac—no data leaves your device.</p>
-        </footer>
-      </main>
-    </div>
+          <footer className="flex flex-col gap-1 pb-2">
+            <p className="text-[11px] text-ink-faint">
+              Generated {formatDateTime(new Date())}. Refresh anytime to pull the latest stats.
+            </p>
+            <p className="text-[11px] text-ink-ghost">
+              All analysis happens locally on your Mac — no data leaves your device.
+            </p>
+          </footer>
+        </div>
+      </div>
+    </AppShell>
   );
 }

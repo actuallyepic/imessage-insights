@@ -1,112 +1,175 @@
-'use client';
+"use client";
 
 import Link from "next/link";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { GlobalRangeBar } from "@/components/global-range-bar";
-import { PersonDrawer, type PersonCallStats, type PersonMessageStats, type PersonMessageThread, type PersonRecentCall } from "@/components/person-drawer";
+import { PRESET_LABELS, PageHeader, RangeControl } from "@/components/app-shell";
+import {
+  AreaChart,
+  AxisLabels,
+  Avatar,
+  Donut,
+  EmptyNote,
+  ErrorBanner,
+  LegendItem,
+  Panel,
+  PanelSubtitle,
+  PanelTitle,
+  SkeletonPanel,
+  Sparkline,
+  SplitBar,
+  StatBadge,
+  StatCard,
+} from "@/components/ui/primitives";
 import { useGlobalRange } from "@/hooks/use-global-range";
 import { useStatsSummary } from "@/hooks/use-stats-summary";
-import type { SerializableConversationStats as ConversationStats } from "@/lib/imessage/types";
 import { fetchAllCalls, type CallApiRecord } from "@/lib/callhistory/client";
+import {
+  chatLabel,
+  formatCompact,
+  formatCount,
+  formatDateTime,
+  formatDayLong,
+  formatDayShort,
+  formatDuration,
+  formatHourLabel,
+  formatHourRange,
+  formatPercent,
+  formatShortDuration,
+  share,
+  toDate,
+} from "@/lib/format";
+import type { SerializableConversationStats as ConversationStats } from "@/lib/imessage/types";
 
-function formatNumber(value: number) {
-  return value.toLocaleString();
+/* ------------------------------------------------------------------ *
+ * Local helpers
+ * ------------------------------------------------------------------ */
+
+/** Widest the activity chart ever gets; longer ranges are grouped into even chunks. */
+const CHART_MAX_POINTS = 400;
+/** Sparklines are 110px wide — more than ~20 points is mush. */
+const SPARK_MAX_POINTS = 20;
+/** Guard against a corrupt timestamp producing a runaway day spine. */
+const MAX_SPINE_DAYS = 20_000;
+
+/** Local-time "YYYY-MM-DD". Daily buckets arrive as local midnight, so this round-trips them. */
+function dayKey(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
-const compactFormatter = Intl.NumberFormat(undefined, {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
+function dayKeyToDate(key: string): Date {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
 
-function formatCompactNumber(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "—";
-  try {
-    return compactFormatter.format(value);
-  } catch {
-    return formatNumber(value);
+type DayBucket = {
+  key: string;
+  date: Date;
+  messages: number;
+  calls: number;
+  answered: number;
+  talkSeconds: number;
+};
+
+/** Splits a day spine into at most `maxPoints` consecutive, equal-width chunks. */
+function chunkBuckets(buckets: DayBucket[], maxPoints: number): DayBucket[][] {
+  if (buckets.length === 0) return [];
+  const size = Math.max(1, Math.ceil(buckets.length / maxPoints));
+  const chunks: DayBucket[][] = [];
+  for (let i = 0; i < buckets.length; i += size) {
+    chunks.push(buckets.slice(i, i + size));
   }
+  return chunks;
 }
 
-function formatDuration(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
-  const wholeSeconds = Math.floor(seconds);
-  const mins = Math.floor(wholeSeconds / 60);
-  const hrs = Math.floor(mins / 60);
-  const remMins = mins % 60;
-  const remSecs = wholeSeconds % 60;
-  if (hrs > 0) return `${hrs}h ${remMins}m`;
-  if (mins > 0) return `${mins}m ${remSecs}s`;
-  return `${remSecs}s`;
+function sumOver(chunks: DayBucket[][], pick: (bucket: DayBucket) => number): number[] {
+  return chunks.map((chunk) => chunk.reduce((sum, bucket) => sum + pick(bucket), 0));
 }
 
-function formatPercent(value: number) {
-  if (!Number.isFinite(value) || value < 0) return "—";
-  return `${Math.round(value * 100)}%`;
+const total = (values: number[]) => values.reduce((sum, value) => sum + value, 0);
+
+/**
+ * Honest in-range trend: the second half of the range against the first.
+ * Halves are equal length (a middle day is dropped when the count is odd) and
+ * `null` when there isn't enough of a range — or enough signal — to compare.
+ */
+function halfOverHalfTrend(values: number[]): number | null {
+  if (values.length < 4) return null;
+  const half = Math.floor(values.length / 2);
+  const first = total(values.slice(0, half));
+  const second = total(values.slice(values.length - half));
+  if (first <= 0) return null;
+  return (second - first) / first;
 }
 
-function parseDate(value: string | null) {
-  if (!value) return null;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return null;
-  return date;
+/** Same comparison for a rate, expressed in percentage points (a % change of a % is ambiguous). */
+function halfOverHalfRatePoints(chunks: DayBucket[][]): number | null {
+  if (chunks.length < 4) return null;
+  const half = Math.floor(chunks.length / 2);
+  const rate = (slice: DayBucket[][]) => {
+    const flat = slice.flat();
+    const calls = total(flat.map((b) => b.calls));
+    if (calls <= 0) return null;
+    return total(flat.map((b) => b.answered)) / calls;
+  };
+  const first = rate(chunks.slice(0, half));
+  const second = rate(chunks.slice(chunks.length - half));
+  if (first === null || second === null) return null;
+  return second - first;
 }
 
-function StatCard({
-  label,
-  value,
-  description,
-}: {
-  label: string;
-  value: string;
-  description?: string;
-}) {
-  return (
-    <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-      <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">{label}</p>
-      <p className="mt-3 text-3xl font-semibold text-white">{value}</p>
-      {description ? <p className="mt-1 text-sm text-neutral-300">{description}</p> : null}
-    </div>
-  );
+/** Four evenly spaced ticks across a chart's x-domain. */
+function axisTicks(dates: Date[]): string[] {
+  if (dates.length === 0) return [];
+  if (dates.length <= 4) return dates.map((date) => formatDayShort(date));
+  const picks = [0, Math.round((dates.length - 1) / 3), Math.round(((dates.length - 1) * 2) / 3), dates.length - 1];
+  return picks.map((index) => formatDayShort(dates[index]));
 }
 
-type PersonAggregate = {
+function getCallParticipants(call: CallApiRecord) {
+  if (call.participants.length > 0) {
+    // The join table names a participant only when macOS Contacts matched the handle.
+    // On a one-to-one call the record's own ZNAME is that same party, so prefer it
+    // over falling through to a bare phone number.
+    if (call.participants.length === 1 && !call.participants[0].displayName?.trim() && call.name?.trim()) {
+      return [{ ...call.participants[0], displayName: call.name.trim() }];
+    }
+    return call.participants;
+  }
+  if (call.address) return [{ id: null, handle: call.address, displayName: call.name }];
+  return [];
+}
+
+type CallPerson = {
   key: string;
   label: string;
   calls: number;
   durationSeconds: number;
-  answered: number;
   missedIncoming: number;
-  outgoing: number;
   lastCallAt: Date | null;
 };
 
-function getCallParticipants(call: CallApiRecord) {
-  if (call.participants.length > 0) return call.participants;
-  if (call.address) return [{ handle: call.address, displayName: call.name }];
-  return [];
-}
-
-function aggregateCallPeople(calls: CallApiRecord[]) {
-  const map = new Map<string, PersonAggregate>();
+/** Rolls the call log up per identity key (shared with `participantBreakdown[].id`). */
+function aggregateCallPeople(calls: CallApiRecord[]): CallPerson[] {
+  const map = new Map<string, CallPerson>();
 
   for (const call of calls) {
     const participants = getCallParticipants(call);
-    const keys = new Set(
-      participants
-        .map((participant) => participant.id ?? participant.handle)
-        .filter(Boolean),
-    );
-    const startedAt = parseDate(call.startedAt);
+    const startedAt = toDate(call.startedAt);
     const duration = Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
     const missedIncoming = call.direction === "incoming" && !call.answered ? 1 : 0;
-    const outgoing = call.direction === "outgoing" ? 1 : 0;
+    const seen = new Set<string>();
 
-    for (const key of keys) {
-      const participant = participants.find((p) => (p.id ?? p.handle) === key);
-      const handle = participant?.handle ?? key;
-      const label = participant?.displayName?.trim() || handle;
+    for (const participant of participants) {
+      const key = participant.id ?? participant.handle;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const label = participant.displayName?.trim() || participant.handle || key;
+
       const existing = map.get(key);
       if (!existing) {
         map.set(key, {
@@ -114,9 +177,7 @@ function aggregateCallPeople(calls: CallApiRecord[]) {
           label,
           calls: 1,
           durationSeconds: duration,
-          answered: call.answered ? 1 : 0,
           missedIncoming,
-          outgoing,
           lastCallAt: startedAt,
         });
         continue;
@@ -124,9 +185,7 @@ function aggregateCallPeople(calls: CallApiRecord[]) {
 
       existing.calls += 1;
       existing.durationSeconds += duration;
-      existing.answered += call.answered ? 1 : 0;
       existing.missedIncoming += missedIncoming;
-      existing.outgoing += outgoing;
       if (startedAt && (!existing.lastCallAt || startedAt > existing.lastCallAt)) {
         existing.lastCallAt = startedAt;
       }
@@ -139,43 +198,68 @@ function aggregateCallPeople(calls: CallApiRecord[]) {
   return Array.from(map.values());
 }
 
+type ContactActivity = {
+  key: string;
+  label: string;
+  messageCount: number;
+  fromMeCount: number;
+  fromThemCount: number;
+  callCount: number;
+  talkSeconds: number;
+};
+
+/** The design's trend pill. Meaning is spelled out in the card's caption. */
+function TrendBadge({ trend, unit = "percent" }: { trend: number | null; unit?: "percent" | "points" }) {
+  if (trend === null) return null;
+  const up = trend >= 0;
+  const magnitude =
+    unit === "points" ? `${Math.abs(trend * 100).toFixed(1)}pp` : formatPercent(Math.abs(trend), 1);
+  return (
+    <StatBadge tint={up ? "accent" : "rose"}>
+      {up ? "▲" : "▼"} {magnitude}
+    </StatBadge>
+  );
+}
+
+/** Sparkline + the caption that disambiguates the trend pill above it. */
+function StatFooter({
+  values,
+  color,
+  delay,
+  trended,
+  detail,
+}: {
+  values: number[];
+  color: string;
+  delay: number;
+  trended: boolean;
+  detail?: string;
+}) {
+  const caption = [trended ? "vs first half of range" : null, detail].filter(Boolean).join(" · ");
+  return (
+    <>
+      <Sparkline values={values} color={color} delay={delay} />
+      {caption ? <p className="mt-1.5 text-[10px] leading-snug text-ink-ghost">{caption}</p> : null}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Screen
+ * ------------------------------------------------------------------ */
+
 export default function OverviewDashboard() {
   const { range, searchParams } = useGlobalRange();
-  const preservedQuery = searchParams.toString();
-  const querySuffix = preservedQuery ? `?${preservedQuery}` : "";
-  const overviewHref = `/${querySuffix}`;
-  const messagesHref = `/messages${querySuffix}`;
-  const callsHref = `/calls${querySuffix}`;
-  const [selectedPersonKey, setSelectedPersonKey] = useState<string | null>(null);
-  type ContactActivity = {
-    key: string;
-    label: string;
-    messageCount: number;
-    fromMeCount: number;
-    fromThemCount: number;
-    callCount: number;
-    talkSeconds: number;
-    missedIncoming: number;
-    outgoingCalls: number;
-    lastActivityAt: Date | null;
-  };
 
   const messagesQueryInput = useMemo(() => {
-    if (!range.startIso || !range.endIso) {
-      return { limit: 50 } as const;
-    }
-    return {
-      limit: 50,
-      start: range.startIso,
-      end: range.endIso,
-    } as const;
+    if (!range.startIso || !range.endIso) return { limit: 50 } as const;
+    return { limit: 50, start: range.startIso, end: range.endIso } as const;
   }, [range.endIso, range.startIso]);
+
   const {
     data: messagesData,
     isPending: messagesLoading,
-    isFetching: messagesFetching,
     error: messagesErrorRaw,
-    refetch: refetchMessages,
   } = useStatsSummary(messagesQueryInput);
 
   const callsQuery = useQuery({
@@ -188,101 +272,179 @@ export default function OverviewDashboard() {
   });
 
   const messages = (messagesData as ConversationStats | undefined) ?? null;
-  const allCalls = callsQuery.data ?? [];
+  const allCalls = useMemo(() => callsQuery.data ?? [], [callsQuery.data]);
 
-  const callHistoryEarliest = useMemo(() => {
-    let earliest: Date | null = null;
-    for (const call of allCalls) {
-      const startedAt = parseDate(call.startedAt);
-      if (!startedAt) continue;
-      if (!earliest || startedAt < earliest) {
-        earliest = startedAt;
-      }
-    }
-    return earliest;
-  }, [allCalls]);
-
+  // `fetchAllCalls` is unfiltered — the range is applied here.
   const filteredCalls = useMemo(() => {
     const start = range.startDate;
     const end = range.endDate;
     if (!start || !end) return allCalls;
     return allCalls.filter((call) => {
-      const startedAt = parseDate(call.startedAt);
+      const startedAt = toDate(call.startedAt);
       if (!startedAt) return false;
       return startedAt >= start && startedAt <= end;
     });
-  }, [allCalls, range.endIso, range.startIso, range.endDate, range.startDate]);
+  }, [allCalls, range.endDate, range.startDate]);
 
-  const callTotals = useMemo(() => {
-    let totalDuration = 0;
-    let answered = 0;
-    let missed = 0;
-    let latest: Date | null = null;
+  /* ---- Aligned day spine (messages + calls share an x-axis) ---- */
 
-    for (const call of filteredCalls) {
-      totalDuration += Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
-      if (call.answered) answered += 1;
-      else missed += 1;
-      const startedAt = parseDate(call.startedAt);
-      if (startedAt && (!latest || startedAt > latest)) latest = startedAt;
+  const dayBuckets = useMemo<DayBucket[]>(() => {
+    const messageDays = new Map<string, number>();
+    for (const bucket of messages?.dailyCounts ?? []) {
+      const date = toDate(bucket.date);
+      if (!date) continue;
+      const key = dayKey(date);
+      const count = Math.max(0, bucket.sentCount) + Math.max(0, bucket.receivedCount);
+      messageDays.set(key, (messageDays.get(key) ?? 0) + count);
     }
 
+    const callDays = new Map<string, { calls: number; answered: number; talkSeconds: number }>();
+    for (const call of filteredCalls) {
+      const date = toDate(call.startedAt);
+      if (!date) continue;
+      const key = dayKey(date);
+      const entry = callDays.get(key) ?? { calls: 0, answered: 0, talkSeconds: 0 };
+      entry.calls += 1;
+      if (call.answered) entry.answered += 1;
+      entry.talkSeconds += Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
+      callDays.set(key, entry);
+    }
+
+    // "YYYY-MM-DD" sorts chronologically.
+    const observed = Array.from(new Set([...messageDays.keys(), ...callDays.keys()])).sort();
+    // Prefer the selected range's bounds so quiet leading/trailing days still register.
+    const firstKey = range.startDate ? dayKey(range.startDate) : observed[0];
+    const lastKey = range.endDate ? dayKey(range.endDate) : observed[observed.length - 1];
+    if (!firstKey || !lastKey || lastKey < firstKey) return [];
+
+    const spine: DayBucket[] = [];
+    const cursor = dayKeyToDate(firstKey);
+    const last = dayKeyToDate(lastKey);
+    while (cursor <= last && spine.length < MAX_SPINE_DAYS) {
+      const key = dayKey(cursor);
+      const calls = callDays.get(key);
+      spine.push({
+        key,
+        date: new Date(cursor),
+        messages: messageDays.get(key) ?? 0,
+        calls: calls?.calls ?? 0,
+        answered: calls?.answered ?? 0,
+        talkSeconds: calls?.talkSeconds ?? 0,
+      });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return spine;
+  }, [filteredCalls, messages, range.endDate, range.startDate]);
+
+  const chartChunks = useMemo(() => chunkBuckets(dayBuckets, CHART_MAX_POINTS), [dayBuckets]);
+  const sparkChunks = useMemo(() => chunkBuckets(dayBuckets, SPARK_MAX_POINTS), [dayBuckets]);
+
+  const chunkDays = chartChunks[0]?.length ?? 1;
+  const granularity = chunkDays === 1 ? "Daily volume" : `${chunkDays}-day volume`;
+
+  const messageSeries = useMemo(() => sumOver(chartChunks, (b) => b.messages), [chartChunks]);
+  const callSeries = useMemo(() => sumOver(chartChunks, (b) => b.calls), [chartChunks]);
+  const axisLabels = useMemo(() => axisTicks(chartChunks.map((chunk) => chunk[0].date)), [chartChunks]);
+
+  const messageSpark = useMemo(() => sumOver(sparkChunks, (b) => b.messages), [sparkChunks]);
+  const callSpark = useMemo(() => sumOver(sparkChunks, (b) => b.calls), [sparkChunks]);
+  const talkSpark = useMemo(() => sumOver(sparkChunks, (b) => b.talkSeconds), [sparkChunks]);
+  // A connect rate is undefined on a day with no calls — those chunks are dropped rather than zeroed.
+  const connectSpark = useMemo(
+    () =>
+      sparkChunks
+        .map((chunk) => {
+          const calls = total(chunk.map((b) => b.calls));
+          return calls > 0 ? total(chunk.map((b) => b.answered)) / calls : null;
+        })
+        .filter((value): value is number => value !== null),
+    [sparkChunks],
+  );
+
+  const dailyMessages = useMemo(() => dayBuckets.map((b) => b.messages), [dayBuckets]);
+  const dailyCalls = useMemo(() => dayBuckets.map((b) => b.calls), [dayBuckets]);
+  const dailyTalk = useMemo(() => dayBuckets.map((b) => b.talkSeconds), [dayBuckets]);
+
+  const messageTrend = halfOverHalfTrend(dailyMessages);
+  const callTrend = halfOverHalfTrend(dailyCalls);
+  const talkTrend = halfOverHalfTrend(dailyTalk);
+  const connectTrend = useMemo(() => halfOverHalfRatePoints(chunkBuckets(dayBuckets, 400)), [dayBuckets]);
+
+  /* ---- Totals ---- */
+
+  const callTotals = useMemo(() => {
+    let talkSeconds = 0;
+    let answered = 0;
+    let latest: Date | null = null;
+    for (const call of filteredCalls) {
+      talkSeconds += Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
+      if (call.answered) answered += 1;
+      const startedAt = toDate(call.startedAt);
+      if (startedAt && (!latest || startedAt > latest)) latest = startedAt;
+    }
     const callCount = filteredCalls.length;
-    const connectRate = callCount > 0 ? answered / callCount : 0;
-    const avgDuration = answered > 0 ? totalDuration / answered : 0;
-    return { callCount, answered, missed, totalDuration, connectRate, avgDuration, latest };
+    return {
+      callCount,
+      answered,
+      missed: callCount - answered,
+      talkSeconds,
+      connectRate: share(answered, callCount),
+      avgTalk: answered > 0 ? talkSeconds / answered : null,
+      latest,
+    };
   }, [filteredCalls]);
+
+  const messageTotals = messages?.totals ?? null;
+
+  const latestActivity = useMemo(() => {
+    const messagesLatest = toDate(messages?.latestMessageAt ?? null);
+    if (!messagesLatest) return callTotals.latest;
+    if (!callTotals.latest) return messagesLatest;
+    return messagesLatest > callTotals.latest ? messagesLatest : callTotals.latest;
+  }, [callTotals.latest, messages?.latestMessageAt]);
+
+  /* ---- Hour of day ---- */
+
+  const hourBars = useMemo(() => {
+    const totals = new Array<number>(24).fill(0);
+    for (const bucket of messages?.hourlyCounts ?? []) {
+      const hour = Number(bucket.hour);
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+      totals[hour] += Math.max(0, bucket.sentCount) + Math.max(0, bucket.receivedCount);
+    }
+    const max = Math.max(...totals);
+    if (max <= 0) return null;
+    return {
+      max,
+      peakHour: totals.indexOf(max),
+      bars: totals.map((count, hour) => {
+        const ratio = count / max;
+        return {
+          hour,
+          count,
+          heightPct: Math.max(6, ratio * 100),
+          // Alpha via opacity keeps the fill on `var(--accent)` so light mode follows.
+          opacity: ratio > 0.75 ? 1 : ratio > 0.4 ? 0.55 : 0.22,
+        };
+      }),
+    };
+  }, [messages?.hourlyCounts]);
+
+  /* ---- People ---- */
 
   const callPeople = useMemo(() => aggregateCallPeople(filteredCalls), [filteredCalls]);
 
-  const topCalledPeople = useMemo(() => {
-    return callPeople
-      .filter((person) => person.calls > 0)
-      .sort(
-        (a, b) =>
-          b.durationSeconds - a.durationSeconds ||
-          b.calls - a.calls ||
-          a.label.localeCompare(b.label),
-      )
-      .slice(0, 6);
-  }, [callPeople]);
-
-  const missedCallLeader = useMemo(() => {
-    const top = callPeople
-      .sort(
-        (a, b) =>
-          b.missedIncoming - a.missedIncoming ||
-          b.calls - a.calls ||
-          a.label.localeCompare(b.label),
-      )
-      .find((person) => person.missedIncoming > 0);
-    return top ?? null;
-  }, [callPeople]);
-
   const messagePeople = useMemo(() => {
     if (!messages) return [];
-
-    const aggregate = new Map<
-      string,
-      {
-        key: string;
-        label: string;
-        messageCount: number;
-        fromMeCount: number;
-        fromThemCount: number;
-        chatIds: Set<number>;
-        lastMessageAt: Date | null;
-      }
-    >();
+    const aggregate = new Map<string, ContactActivity>();
 
     for (const chat of messages.topChats ?? []) {
+      // `sentCount` is the whole thread's outbound total, so group members each
+      // pick it up — hence the "includes your messages in shared group chats" note.
       const mySent = Math.max(0, chat.sentCount ?? 0);
-      const chatLastMessageAt = parseDate(chat.lastMessageAt ?? null);
 
       for (const participant of chat.messageParticipants ?? []) {
-        const isSelf = Boolean(participant.isMe || participant.id === "me");
-        if (isSelf) continue;
-
+        if (participant.isMe || participant.id === "me") continue;
         const key = participant.id ?? participant.displayName ?? `unknown-${chat.chatId}`;
         const label = participant.displayName ?? "Unknown";
         const fromThem = Math.max(0, participant.messageCount ?? 0);
@@ -295,62 +457,24 @@ export default function OverviewDashboard() {
             messageCount: 0,
             fromMeCount: 0,
             fromThemCount: 0,
-            chatIds: new Set<number>(),
-            lastMessageAt: null,
+            callCount: 0,
+            talkSeconds: 0,
           };
 
         existing.messageCount += mySent + fromThem;
         existing.fromMeCount += mySent;
         existing.fromThemCount += fromThem;
-        existing.chatIds.add(chat.chatId);
-
-        if (chatLastMessageAt && (!existing.lastMessageAt || chatLastMessageAt > existing.lastMessageAt)) {
-          existing.lastMessageAt = chatLastMessageAt;
-        }
-
-        if (existing.label === "Unknown" && label !== "Unknown") {
-          existing.label = label;
-        }
-
+        if (existing.label === "Unknown" && label !== "Unknown") existing.label = label;
         aggregate.set(key, existing);
       }
     }
 
-    return Array.from(aggregate.values())
-      .map((entry) => ({
-        key: entry.key,
-        label: entry.label,
-        messageCount: entry.messageCount,
-        fromMeCount: entry.fromMeCount,
-        fromThemCount: entry.fromThemCount,
-        chatCount: entry.chatIds.size,
-        lastMessageAt: entry.lastMessageAt,
-      }))
-      .sort(
-        (a, b) =>
-          b.messageCount - a.messageCount ||
-          b.fromThemCount - a.fromThemCount ||
-          a.label.localeCompare(b.label),
-      );
+    return Array.from(aggregate.values());
   }, [messages]);
 
   const mostContacted = useMemo(() => {
     const combined = new Map<string, ContactActivity>();
-
-    for (const person of messagePeople) {
-      combined.set(person.key, {
-        key: person.key,
-        label: person.label,
-        messageCount: person.messageCount,
-        fromMeCount: person.fromMeCount,
-        fromThemCount: person.fromThemCount,
-        callCount: 0,
-        talkSeconds: 0,
-        missedIncoming: 0,
-        outgoingCalls: 0,
-        lastActivityAt: person.lastMessageAt,
-      });
-    }
+    for (const person of messagePeople) combined.set(person.key, { ...person });
 
     for (const person of callPeople) {
       const existing =
@@ -363,101 +487,65 @@ export default function OverviewDashboard() {
           fromThemCount: 0,
           callCount: 0,
           talkSeconds: 0,
-          missedIncoming: 0,
-          outgoingCalls: 0,
-          lastActivityAt: null,
         };
-
       existing.callCount += person.calls;
       existing.talkSeconds += person.durationSeconds;
-      existing.missedIncoming += person.missedIncoming;
-      existing.outgoingCalls += person.outgoing;
-
-      if (person.lastCallAt && (!existing.lastActivityAt || person.lastCallAt > existing.lastActivityAt)) {
-        existing.lastActivityAt = person.lastCallAt;
-      }
-
-      if (existing.label === existing.key && person.label !== person.key) {
-        existing.label = person.label;
-      }
-
+      if (existing.label === existing.key && person.label !== person.key) existing.label = person.label;
       combined.set(person.key, existing);
     }
 
-    const activityScore = (entry: ContactActivity) => {
-      const messageScore = Math.log1p(Math.max(0, entry.messageCount));
-      const callScore = Math.log1p(Math.max(0, entry.callCount));
-      const talkScore = Math.log1p(Math.max(0, entry.talkSeconds) / 60) * 0.6;
-      return messageScore + callScore + talkScore;
-    };
+    // Log-scaled so a single marathon call can't outrank a year of messages.
+    const activityScore = (entry: ContactActivity) =>
+      Math.log1p(Math.max(0, entry.messageCount)) +
+      Math.log1p(Math.max(0, entry.callCount)) +
+      Math.log1p(Math.max(0, entry.talkSeconds) / 60) * 0.6;
 
     return Array.from(combined.values())
       .filter((entry) => entry.messageCount > 0 || entry.callCount > 0)
-      .sort((a, b) => {
-        const diff = activityScore(b) - activityScore(a);
-        if (diff !== 0) return diff;
-        return (
+      .sort(
+        (a, b) =>
+          activityScore(b) - activityScore(a) ||
           b.messageCount - a.messageCount ||
           b.callCount - a.callCount ||
-          b.talkSeconds - a.talkSeconds ||
-          a.label.localeCompare(b.label)
-        );
-      })
-      .slice(0, 10);
+          a.label.localeCompare(b.label),
+      )
+      .slice(0, 6);
   }, [callPeople, messagePeople]);
 
-  const messagesLatest = parseDate(messages?.latestMessageAt ?? null);
-  const latestActivity = useMemo(() => {
-    if (!messagesLatest && !callTotals.latest) return null;
-    if (!messagesLatest) return callTotals.latest;
-    if (!callTotals.latest) return messagesLatest;
-    return messagesLatest > callTotals.latest ? messagesLatest : callTotals.latest;
-  }, [callTotals.latest, messagesLatest]);
+  const topThreads = useMemo(() => (messages?.topChats ?? []).slice(0, 5), [messages?.topChats]);
 
-  const messageTotals = messages?.totals ?? null;
-  const firstReplyTimes = messages?.firstReplyTimes ?? null;
-  const myMedian = firstReplyTimes?.meResponding?.medianSeconds ?? null;
-  const theirMedian = firstReplyTimes?.themResponding?.medianSeconds ?? null;
+  const missedCallLeader = useMemo(() => {
+    const ranked = [...callPeople]
+      .filter((person) => person.missedIncoming > 0)
+      .sort((a, b) => b.missedIncoming - a.missedIncoming || a.label.localeCompare(b.label));
+    return ranked[0] ?? null;
+  }, [callPeople]);
+
   const messagesPerCall =
     messageTotals && callTotals.callCount > 0 ? messageTotals.messageCount / callTotals.callCount : null;
 
-  const topChats = messages?.topChats?.slice(0, 6) ?? [];
-  const topPeopleByMessages = messagePeople.slice(0, 6);
+  /* ---- Reply times ---- */
 
-  const messagesError =
-    messagesErrorRaw instanceof Error ? messagesErrorRaw.message : messagesErrorRaw ? "Unable to load messages." : null;
-  const callsError =
-    callsQuery.error instanceof Error ? callsQuery.error.message : callsQuery.error ? "Unable to load calls." : null;
+  const myReply = messages?.firstReplyTimes?.meResponding ?? null;
+  const theirReply = messages?.firstReplyTimes?.themResponding ?? null;
+  const myMedian = myReply?.medianSeconds ?? null;
+  const theirMedian = theirReply?.medianSeconds ?? null;
+  const replyRatio =
+    myMedian && theirMedian && myMedian > 0 && theirMedian > 0 ? theirMedian / myMedian : null;
 
-  const handleRefresh = async () => {
-    await Promise.allSettled([refetchMessages(), callsQuery.refetch()]);
-  };
+  /* ---- Links ---- */
 
-  const isRefreshing = messagesFetching || callsQuery.isFetching;
+  const personHref = useCallback(
+    (key: string, label: string) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("key", key);
+      params.set("label", label);
+      return `/people?${params.toString()}`;
+    },
+    [searchParams],
+  );
 
-  const personLabelMap = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const person of messagePeople) {
-      map.set(person.key, person.label);
-    }
-    for (const person of callPeople) {
-      const existing = map.get(person.key);
-      if (!existing || existing === person.key) {
-        map.set(person.key, person.label);
-      }
-    }
-    return map;
-  }, [callPeople, messagePeople]);
-
-  const selectedPerson = useMemo(() => {
-    if (!selectedPersonKey) return null;
-    return {
-      key: selectedPersonKey,
-      label: personLabelMap.get(selectedPersonKey) ?? "Unknown",
-    };
-  }, [personLabelMap, selectedPersonKey]);
-
-  const buildReportUrl = useCallback(
+  const threadHref = useCallback(
     (chatId: number) => {
       const params = new URLSearchParams();
       if (range.startIso) params.set("start", range.startIso);
@@ -468,426 +556,386 @@ export default function OverviewDashboard() {
     [range.endIso, range.startIso],
   );
 
-  const selectedMessageThreads = useMemo(() => {
-    if (!selectedPersonKey || !messages) return [];
-    const threads: PersonMessageThread[] = [];
-    for (const chat of messages.topChats ?? []) {
-      const mySent = Math.max(0, chat.sentCount ?? 0);
-      const lastMessageAt = parseDate(chat.lastMessageAt ?? null);
-      const participant = (chat.messageParticipants ?? []).find((p) => {
-        const isSelf = Boolean(p.isMe || p.id === "me");
-        if (isSelf) return false;
-        const key = p.id ?? p.displayName ?? `unknown-${chat.chatId}`;
-        return key === selectedPersonKey;
-      });
-      if (!participant) continue;
-      const fromThem = Math.max(0, participant.messageCount ?? 0);
-      const label =
-        chat.chatDisplayName ??
-        (chat.participants.length > 0 ? chat.participants.join(", ") : `Chat ${chat.chatId}`);
-      threads.push({
-        chatId: chat.chatId,
-        label,
-        isGroup: Boolean(chat.isGroup),
-        totalMessages: mySent + fromThem,
-        fromMeMessages: mySent,
-        fromThemMessages: fromThem,
-        lastMessageAt,
-        href: buildReportUrl(chat.chatId),
-      });
-    }
-    return threads
-      .sort(
-        (a, b) =>
-          b.totalMessages - a.totalMessages ||
-          (b.lastMessageAt?.getTime() ?? 0) - (a.lastMessageAt?.getTime() ?? 0) ||
-          a.label.localeCompare(b.label),
-      )
-      .slice(0, 8);
-  }, [buildReportUrl, messages, selectedPersonKey]);
+  /* ---- Header copy ---- */
 
-  const selectedMessageStats = useMemo<PersonMessageStats | null>(() => {
-    if (!selectedPersonKey) return null;
-    const summary = messagePeople.find((person) => person.key === selectedPersonKey);
-    if (!summary) return null;
-    return {
-      totalMessages: summary.messageCount,
-      fromMeMessages: summary.fromMeCount,
-      fromThemMessages: summary.fromThemCount,
-      chatCount: summary.chatCount,
-      lastMessageAt: summary.lastMessageAt,
-      threads: selectedMessageThreads,
-    };
-  }, [messagePeople, selectedMessageThreads, selectedPersonKey]);
+  const rangeLabel =
+    range.mode === "preset" ? PRESET_LABELS[range.preset] : range.mode === "day" ? "Single day" : "Custom range";
 
-  const selectedCallStats = useMemo<PersonCallStats | null>(() => {
-    if (!selectedPersonKey) return null;
-    let totalCalls = 0;
-    let incomingCalls = 0;
-    let outgoingCalls = 0;
-    let answeredCalls = 0;
-    let missedIncomingCalls = 0;
-    let talkSeconds = 0;
-    let lastCallAt: Date | null = null;
-    const recentCalls: PersonRecentCall[] = [];
+  const subtitle = (
+    <>
+      {rangeLabel}
+      {range.startDate && range.endDate ? (
+        <> · {formatDayShort(range.startDate)} – {formatDayLong(range.endDate)}</>
+      ) : null}
+      {latestActivity ? (
+        <>
+          {" · "}
+          <span className="text-ink-muted">latest activity {formatDateTime(latestActivity)}</span>
+        </>
+      ) : null}
+    </>
+  );
 
-    for (const call of filteredCalls) {
-      const participants = getCallParticipants(call);
-      const keys = new Set(
-        participants.map((participant) => participant.id ?? participant.handle).filter(Boolean),
-      );
-      if (!keys.has(selectedPersonKey)) continue;
+  const messagesError =
+    messagesErrorRaw instanceof Error ? messagesErrorRaw.message : messagesErrorRaw ? "Unable to load messages." : null;
+  const callsError =
+    callsQuery.error instanceof Error ? callsQuery.error.message : callsQuery.error ? "Unable to load calls." : null;
 
-      totalCalls += 1;
-      if (call.direction === "incoming") incomingCalls += 1;
-      if (call.direction === "outgoing") outgoingCalls += 1;
-      if (call.answered) answeredCalls += 1;
-      if (call.direction === "incoming" && !call.answered) missedIncomingCalls += 1;
-
-      const duration = Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
-      talkSeconds += duration;
-
-      const startedAt = parseDate(call.startedAt);
-      if (startedAt && (!lastCallAt || startedAt > lastCallAt)) {
-        lastCallAt = startedAt;
-      }
-      recentCalls.push({
-        callId: call.callId,
-        startedAt,
-        durationSeconds: duration,
-        answered: call.answered,
-        direction: call.direction,
-        provider: call.provider,
-        media: call.media,
-      });
-    }
-
-    recentCalls.sort(
-      (a, b) =>
-        (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0) ||
-        b.callId - a.callId,
-    );
-
-    return {
-      totalCalls,
-      incomingCalls,
-      outgoingCalls,
-      answeredCalls,
-      missedIncomingCalls,
-      talkSeconds,
-      lastCallAt,
-      recentCalls: recentCalls.slice(0, 8),
-      callsInRange: recentCalls,
-    };
-  }, [filteredCalls, selectedPersonKey]);
+  const loading = messagesLoading || callsQuery.isPending;
+  const isEmpty =
+    !loading && (messageTotals?.messageCount ?? 0) === 0 && callTotals.callCount === 0;
 
   return (
-    <div className="min-h-screen bg-neutral-950 pb-16 text-neutral-100">
-      <header className="border-b border-neutral-900/60 bg-neutral-950/95 py-6">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-6">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <Link
-                href={overviewHref}
-                className="rounded-full border border-neutral-800/80 bg-white/5 px-3 py-1 text-xs font-semibold text-white"
-              >
-                Overview
-              </Link>
-              <Link
-                href={messagesHref}
-                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
-              >
-                Messages
-              </Link>
-              <Link
-                href={callsHref}
-                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
-              >
-                Calls
-              </Link>
-            </div>
+    <>
+      <PageHeader title="Overview" subtitle={subtitle} actions={<RangeControl />} />
 
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={handleRefresh}
-                disabled={isRefreshing}
-                className="rounded-full border border-neutral-800/80 bg-neutral-900/70 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {isRefreshing ? "Refreshing…" : "Refresh"}
-              </button>
-            </div>
+      {messagesError ? <ErrorBanner title="Messages couldn’t load" detail={messagesError} /> : null}
+      {callsError ? <ErrorBanner title="Calls couldn’t load" detail={callsError} /> : null}
+
+      {loading ? (
+        <>
+          <div className="grid gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+            {[0, 1, 2, 3].map((i) => (
+              <SkeletonPanel key={i} height={140} />
+            ))}
+          </div>
+          <div className="grid gap-3.5 lg:grid-cols-[1.85fr_1fr]">
+            <SkeletonPanel height={300} />
+            <SkeletonPanel height={300} />
+          </div>
+          <SkeletonPanel height={200} />
+          <div className="grid gap-3.5 lg:grid-cols-[1.6fr_1fr]">
+            <SkeletonPanel height={320} />
+            <SkeletonPanel height={320} />
+          </div>
+        </>
+      ) : isEmpty ? (
+        <Panel className="rounded-[20px] px-[22px] py-8">
+          <PanelTitle>No activity in this range</PanelTitle>
+          <PanelSubtitle>Pick a wider range to see messages and calls.</PanelSubtitle>
+        </Panel>
+      ) : (
+        <>
+          {/* ---- Stat cards ---- */}
+          <div className="grid gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+            <StatCard
+              delay={0.02}
+              label="Messages"
+              value={formatCompact(messageTotals?.messageCount ?? 0)}
+              badge={<TrendBadge trend={messageTrend} />}
+              footer={
+                <StatFooter
+                  values={messageSpark}
+                  color="var(--accent)"
+                  delay={0}
+                  trended={messageTrend !== null}
+                  detail={messageTotals ? `${formatCount(messageTotals.messageCount)} total` : undefined}
+                />
+              }
+            />
+            <StatCard
+              delay={0.08}
+              label="Calls"
+              value={formatCompact(callTotals.callCount)}
+              badge={<TrendBadge trend={callTrend} />}
+              footer={
+                <StatFooter
+                  values={callSpark}
+                  color="var(--violet)"
+                  delay={0.1}
+                  trended={callTrend !== null}
+                  detail={`${formatCount(callTotals.answered)} answered · ${formatCount(callTotals.missed)} not`}
+                />
+              }
+            />
+            <StatCard
+              delay={0.14}
+              label="Talk time"
+              value={formatDuration(callTotals.talkSeconds)}
+              badge={<TrendBadge trend={talkTrend} />}
+              footer={
+                <StatFooter
+                  values={talkSpark}
+                  color="var(--sky)"
+                  delay={0.2}
+                  trended={talkTrend !== null}
+                  detail={callTotals.avgTalk !== null ? `Avg ${formatDuration(callTotals.avgTalk)} answered` : undefined}
+                />
+              }
+            />
+            <StatCard
+              delay={0.2}
+              label="Connect rate"
+              value={callTotals.callCount > 0 ? formatPercent(callTotals.connectRate) : "—"}
+              badge={<TrendBadge trend={connectTrend} unit="points" />}
+              footer={
+                <StatFooter
+                  values={connectSpark}
+                  color="var(--amber)"
+                  delay={0.3}
+                  trended={connectTrend !== null}
+                  detail={
+                    callTotals.callCount > 0
+                      ? `${formatCount(callTotals.answered)} of ${formatCount(callTotals.callCount)} answered`
+                      : "No calls in range"
+                  }
+                />
+              }
+            />
           </div>
 
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-white">Communication</h1>
-            <div className="mt-2 flex flex-wrap gap-2 text-xs text-neutral-400">
-              {latestActivity ? (
-                <span className="rounded-full border border-neutral-800/70 bg-neutral-900/40 px-3 py-1">
-                  Latest activity ·{" "}
-                  {latestActivity.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
-                </span>
-              ) : null}
-              {messagesLatest ? (
-                <span className="rounded-full border border-neutral-800/70 bg-neutral-900/40 px-3 py-1">
-                  Latest message ·{" "}
-                  {messagesLatest.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
-                </span>
-              ) : null}
-              {callTotals.latest ? (
-                <span className="rounded-full border border-neutral-800/70 bg-neutral-900/40 px-3 py-1">
-                  Latest call ·{" "}
-                  {callTotals.latest.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
-                </span>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      </header>
-
-      <main className="mx-auto mt-10 flex w-full max-w-6xl flex-col gap-10 px-6">
-        <GlobalRangeBar />
-        {(messagesError || callsError) && (
-          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-5 text-sm text-amber-100">
-            <p className="font-semibold text-amber-200">Some data couldn’t load</p>
-            <ul className="mt-2 list-disc space-y-1 pl-5">
-              {messagesError ? <li>{messagesError}</li> : null}
-              {callsError ? <li>{callsError}</li> : null}
-            </ul>
-          </div>
-        )}
-
-        <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
-          <StatCard
-            label="Messages"
-            value={messagesLoading ? "—" : formatCompactNumber(messageTotals?.messageCount ?? 0)}
-            description={messageTotals ? `${formatNumber(messageTotals.messageCount)} total` : undefined}
-          />
-          <StatCard
-            label="Calls"
-            value={callsQuery.isPending ? "—" : formatCompactNumber(callTotals.callCount)}
-            description={`${formatNumber(callTotals.callCount)} total`}
-          />
-          <StatCard
-            label="Talk time"
-            value={callsQuery.isPending ? "—" : formatDuration(callTotals.totalDuration)}
-            description={callTotals.answered > 0 ? `Avg · ${formatDuration(callTotals.avgDuration)}` : "No answered calls"}
-          />
-          <StatCard
-            label="Connect rate"
-            value={callsQuery.isPending ? "—" : formatPercent(callTotals.connectRate)}
-            description={`${formatNumber(callTotals.answered)} answered · ${formatNumber(callTotals.missed)} not answered`}
-          />
-          <StatCard
-            label="Your first reply"
-            value={myMedian ? formatDuration(myMedian) : "—"}
-            description="Messages only"
-          />
-          <StatCard
-            label="Their first reply"
-            value={theirMedian ? formatDuration(theirMedian) : "—"}
-            description="Messages only"
-          />
-        </section>
-
-        <section className="grid gap-6 lg:grid-cols-2">
-          <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Most contacted</p>
-              <span className="text-xs text-neutral-500">Messages + calls</span>
-            </div>
-            <ul className="mt-4 space-y-3">
-              {messagesLoading || callsQuery.isPending ? (
-                Array.from({ length: 6 }).map((_, index) => (
-                  <li
-                    key={`contact-skel-${index}`}
-                    className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3"
-                  >
-                    <div className="h-3 w-40 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="mt-2 h-3 w-28 animate-pulse rounded bg-neutral-800/60" />
-                  </li>
-                ))
-              ) : mostContacted.length === 0 ? (
-                <li className="text-sm text-neutral-400">No activity for this range.</li>
-              ) : (
-                mostContacted.map((person, index) => (
-                  <li
-                    key={person.key}
-                    className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-0 transition hover:border-neutral-700"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setSelectedPersonKey(person.key)}
-                      className="w-full p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-                    >
-                      <p className="truncate text-sm font-semibold text-neutral-50">
-                        <span className="mr-2 text-xs font-semibold text-neutral-500">#{index + 1}</span>
-                        {person.label || "Unknown"}
-                      </p>
-                      <p className="mt-1 text-xs text-neutral-400">
-                        {formatNumber(person.messageCount)} messages · {formatNumber(person.callCount)} calls ·{" "}
-                        {formatDuration(person.talkSeconds)}
-                      </p>
-                    </button>
-                  </li>
-                ))
-              )}
-            </ul>
-          </div>
-
-          <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Top threads</p>
-              <span className="text-xs text-neutral-500">Messages</span>
-            </div>
-            <ul className="mt-4 space-y-3">
-              {messagesLoading ? (
-                Array.from({ length: 6 }).map((_, index) => (
-                  <li key={`chat-skel-${index}`} className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                    <div className="h-3 w-40 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="mt-2 h-3 w-24 animate-pulse rounded bg-neutral-800/60" />
-                  </li>
-                ))
-              ) : topChats.length === 0 ? (
-                <li className="text-sm text-neutral-400">No message data for this range.</li>
-              ) : (
-                topChats.map((chat, index) => (
-                  <li key={chat.chatId} className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                    <p className="truncate text-sm font-semibold text-neutral-50">
-                      <span className="mr-2 text-xs font-semibold text-neutral-500">#{index + 1}</span>
-                      {chat.chatDisplayName ??
-                        (chat.participants.length > 0 ? chat.participants.join(", ") : "Unknown")}
-                    </p>
-                    <p className="mt-1 text-xs text-neutral-400">{formatNumber(chat.messageCount)} messages</p>
-                  </li>
-                ))
-              )}
-            </ul>
-          </div>
-
-          <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Top people</p>
-              <span className="text-xs text-neutral-500">Messages</span>
-            </div>
-            <ul className="mt-4 space-y-3">
-              {messagesLoading ? (
-                Array.from({ length: 6 }).map((_, index) => (
-                  <li key={`msg-skel-${index}`} className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                    <div className="h-3 w-44 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="mt-2 h-3 w-28 animate-pulse rounded bg-neutral-800/60" />
-                  </li>
-                ))
-              ) : topPeopleByMessages.length === 0 ? (
-                <li className="text-sm text-neutral-400">No people for this range.</li>
-              ) : (
-                topPeopleByMessages.map((person, index) => (
-                  <li
-                    key={person.key}
-                    className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-0 transition hover:border-neutral-700"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setSelectedPersonKey(person.key)}
-                      className="w-full p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-                    >
-                      <p className="truncate text-sm font-semibold text-neutral-50">
-                        <span className="mr-2 text-xs font-semibold text-neutral-500">#{index + 1}</span>
-                        {person.label || "Unknown"}
-                      </p>
-                      <p className="mt-1 text-xs text-neutral-400">
-                        {formatNumber(person.messageCount)} messages · {formatNumber(person.fromMeCount)} from you ·{" "}
-                        {formatNumber(person.fromThemCount)} from them
-                      </p>
-                    </button>
-                  </li>
-                ))
-              )}
-            </ul>
-            <p className="mt-4 text-xs text-neutral-500">Includes your messages in shared group chats.</p>
-          </div>
-
-          <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Top calls</p>
-              <span className="text-xs text-neutral-500">Talk time</span>
-            </div>
-            <ul className="mt-4 space-y-3">
-              {callsQuery.isPending ? (
-                Array.from({ length: 6 }).map((_, index) => (
-                  <li key={`call-skel-${index}`} className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                    <div className="h-3 w-40 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="mt-2 h-3 w-24 animate-pulse rounded bg-neutral-800/60" />
-                  </li>
-                ))
-              ) : topCalledPeople.length === 0 ? (
-                <li className="text-sm text-neutral-400">No call data for this range.</li>
-              ) : (
-                topCalledPeople.map((person, index) => (
-                  <li
-                    key={person.key}
-                    className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-0 transition hover:border-neutral-700"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setSelectedPersonKey(person.key)}
-                      className="w-full p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-                    >
-                      <p className="truncate text-sm font-semibold text-neutral-50">
-                        <span className="mr-2 text-xs font-semibold text-neutral-500">#{index + 1}</span>
-                        {person.label}
-                      </p>
-                      <p className="mt-1 text-xs text-neutral-400">
-                        {formatDuration(person.durationSeconds)} · {formatNumber(person.calls)} calls
-                      </p>
-                    </button>
-                  </li>
-                ))
-              )}
-            </ul>
-
-            <div className="mt-5 rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Quick takes</p>
-              <div className="mt-2 space-y-1 text-sm text-neutral-200">
-                <p>
-                  {messagesPerCall ? (
-                    <>
-                      ≈ {messagesPerCall.toFixed(1)} messages per call
-                    </>
-                  ) : (
-                    <>—</>
-                  )}
-                </p>
-                <p>
-                  {missedCallLeader ? (
-                    <>
-                      Most missed (incoming): <span className="font-semibold text-neutral-50">{missedCallLeader.label}</span> ·{" "}
-                      {formatNumber(missedCallLeader.missedIncoming)}
-                    </>
-                  ) : (
-                    <>No missed incoming calls in view</>
-                  )}
-                </p>
+          {/* ---- Activity over time + balance / reply ---- */}
+          <div className="grid gap-3.5 lg:grid-cols-[1.85fr_1fr]">
+            <Panel delay={0.22} className="rounded-[20px] px-[22px] py-5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <PanelTitle>Activity over time</PanelTitle>
+                  <PanelSubtitle>{granularity}, indexed to peak</PanelSubtitle>
+                </div>
+                <div className="flex gap-3.5">
+                  <LegendItem color="var(--accent)">Messages</LegendItem>
+                  <LegendItem color="var(--violet)">Calls</LegendItem>
+                </div>
               </div>
+              <div className="mt-3.5">
+                <AreaChart
+                  height={200}
+                  series={[
+                    { values: callSeries, color: "var(--violet)", id: "overview-calls", fillOpacity: 0.22 },
+                    { values: messageSeries, color: "var(--accent)", id: "overview-messages", strokeWidth: 2.4 },
+                  ]}
+                />
+              </div>
+              {axisLabels.length > 0 ? <AxisLabels labels={axisLabels} /> : null}
+            </Panel>
+
+            <div className="flex flex-col gap-3.5">
+              <Panel delay={0.26} className="rounded-[20px] px-5 py-[18px]">
+                <PanelTitle>Message balance</PanelTitle>
+                {messageTotals && messageTotals.messageCount > 0 ? (
+                  <div className="mt-3.5 flex items-center gap-[18px]">
+                    <Donut
+                      ratio={share(messageTotals.receivedCount, messageTotals.messageCount)}
+                      primary="var(--accent)"
+                      secondary="var(--sky)"
+                      value={formatPercent(share(messageTotals.receivedCount, messageTotals.messageCount))}
+                      caption="from them"
+                    />
+                    <div className="flex flex-col gap-[11px] text-xs">
+                      <div>
+                        <div className="flex items-center gap-[7px] text-ink-tertiary">
+                          <span className="h-2 w-2 rounded-[2px]" style={{ background: "var(--accent)" }} />
+                          From them
+                        </div>
+                        <p className="ml-[15px] mt-0.5 font-mono text-xs text-ink-faint">
+                          {formatCount(messageTotals.receivedCount)}
+                        </p>
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-[7px] text-ink-tertiary">
+                          <span className="h-2 w-2 rounded-[2px]" style={{ background: "var(--sky)" }} />
+                          From you
+                        </div>
+                        <p className="ml-[15px] mt-0.5 font-mono text-xs text-ink-faint">
+                          {formatCount(messageTotals.sentCount)}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <EmptyNote className="mt-3.5">No messages in this range.</EmptyNote>
+                )}
+              </Panel>
+
+              <Panel delay={0.3} className="flex-1 rounded-[20px] px-5 py-[18px]">
+                <PanelTitle>First reply time</PanelTitle>
+                <PanelSubtitle>Median, messages only</PanelSubtitle>
+                {myMedian !== null || theirMedian !== null ? (
+                  <>
+                    <div className="mt-3.5 flex gap-[22px]">
+                      <div>
+                        <p className="text-[11px] text-ink-dim">You</p>
+                        <p className="mt-1 text-[22px] font-semibold text-accent">{formatShortDuration(myMedian)}</p>
+                      </div>
+                      <div className="w-px bg-line" />
+                      <div>
+                        <p className="text-[11px] text-ink-dim">Them</p>
+                        <p className="mt-1 text-[22px] font-semibold text-violet">{formatShortDuration(theirMedian)}</p>
+                      </div>
+                    </div>
+                    {replyRatio !== null ? (
+                      <p className="mt-3.5 text-[11px] leading-[1.5] text-ink-faint">
+                        {replyRatio >= 1 ? (
+                          <>
+                            You reply{" "}
+                            <span className="font-semibold text-ink-tertiary">{replyRatio.toFixed(1)}× faster</span> than
+                            the people you talk to.
+                          </>
+                        ) : (
+                          <>
+                            They reply{" "}
+                            <span className="font-semibold text-ink-tertiary">{(1 / replyRatio).toFixed(1)}× faster</span>{" "}
+                            than you do.
+                          </>
+                        )}
+                      </p>
+                    ) : null}
+                    <p className="mt-1.5 text-[10px] text-ink-ghost">
+                      {formatCount(myReply?.sampleCount ?? 0)} / {formatCount(theirReply?.sampleCount ?? 0)} replies
+                      sampled
+                    </p>
+                  </>
+                ) : (
+                  <EmptyNote className="mt-3.5">Not enough back-and-forth in this range.</EmptyNote>
+                )}
+              </Panel>
             </div>
           </div>
-        </section>
-      </main>
 
-      <PersonDrawer
-        open={Boolean(selectedPersonKey)}
-        onClose={() => setSelectedPersonKey(null)}
-        person={selectedPerson}
-        messages={selectedMessageStats}
-        calls={selectedCallStats}
-        rangeStartIso={range.startIso}
-        rangeEndIso={range.endIso}
-        callHistoryEarliest={callHistoryEarliest}
-        isMessagesLoading={messagesLoading || messagesFetching}
-        isCallsLoading={callsQuery.isPending || callsQuery.isFetching}
-        messagesError={messagesError}
-        callsError={callsError}
-      />
-    </div>
+          {/* ---- Hour of day ---- */}
+          <Panel delay={0.32} className="rounded-[20px] px-[22px] py-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <PanelTitle>When you communicate</PanelTitle>
+                <PanelSubtitle>Messages by hour of day</PanelSubtitle>
+              </div>
+              {hourBars ? (
+                <p className="text-xs text-ink-muted">
+                  Peak · <span className="font-semibold text-accent">{formatHourRange(hourBars.peakHour)}</span>
+                </p>
+              ) : null}
+            </div>
+            {hourBars ? (
+              <>
+                <div className="mt-4 flex h-24 items-end gap-1">
+                  {hourBars.bars.map((bar) => (
+                    <div key={bar.hour} className="flex h-full flex-1 flex-col justify-end">
+                      <div
+                        className="animate-bar w-full origin-bottom rounded-t-[4px] rounded-b-[2px]"
+                        style={{
+                          height: `${bar.heightPct}%`,
+                          background: "var(--accent)",
+                          opacity: bar.opacity,
+                          animationDelay: `${(bar.hour * 0.02).toFixed(2)}s`,
+                        }}
+                      >
+                        <span className="sr-only">
+                          {formatHourRange(bar.hour)}: {formatCount(bar.count)} messages
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <AxisLabels
+                  className="mt-2.5"
+                  labels={[0, 6, 12, 18, 23].map((hour) => formatHourLabel(hour))}
+                />
+              </>
+            ) : (
+              <EmptyNote className="mt-3.5">No messages in this range.</EmptyNote>
+            )}
+          </Panel>
+
+          {/* ---- Most contacted + threads / insight ---- */}
+          <div className="grid gap-3.5 lg:grid-cols-[1.6fr_1fr]">
+            <Panel delay={0.34} className="rounded-[20px] px-[22px] py-5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <PanelTitle>Most contacted</PanelTitle>
+                <span className="text-[11px] text-ink-faint">Messages + calls</span>
+              </div>
+              {mostContacted.length > 0 ? (
+                <div className="mt-3 flex flex-col gap-0.5">
+                  {mostContacted.map((person, index) => (
+                    <Link
+                      key={person.key}
+                      href={personHref(person.key, person.label)}
+                      className="flex items-center gap-[13px] rounded-xl px-2 py-[9px] transition-colors hover:bg-surface"
+                    >
+                      <span className="w-4 flex-none font-mono text-[11px] text-ink-ghost">{index + 1}</span>
+                      <Avatar label={person.label} identityKey={person.key} size={34} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-baseline justify-between gap-2.5">
+                          <span className="truncate text-[13px] font-semibold text-ink-primary">{person.label}</span>
+                          <span className="flex-none font-mono text-[11px] text-ink-faint">
+                            {person.talkSeconds > 0 ? formatDuration(person.talkSeconds) : "—"}
+                          </span>
+                        </div>
+                        <div className="mt-1.5 flex items-center gap-2">
+                          <SplitBar
+                            className="flex-1"
+                            segments={[
+                              { value: person.fromThemCount, color: "var(--accent)" },
+                              { value: person.fromMeCount, color: "var(--sky)" },
+                            ]}
+                          />
+                          <span className="flex-none whitespace-nowrap font-mono text-[10px] text-ink-ghost">
+                            {formatCount(person.messageCount)} · {formatCount(person.callCount)} calls
+                          </span>
+                        </div>
+                      </div>
+                    </Link>
+                  ))}
+                </div>
+              ) : (
+                <EmptyNote className="mt-3.5">No contacts in this range.</EmptyNote>
+              )}
+              <p className="mt-3 text-[10px] text-ink-ghost">
+                Bar splits messages from them <span className="text-accent">▪</span> vs from you{" "}
+                <span className="text-sky">▪</span>. Includes your messages in shared group chats.
+              </p>
+            </Panel>
+
+            <div className="flex flex-col gap-3.5">
+              <Panel delay={0.38} className="rounded-[20px] px-5 py-[18px]">
+                <PanelTitle className="mb-3">Top threads</PanelTitle>
+                {topThreads.length > 0 ? (
+                  <div className="flex flex-col gap-[11px]">
+                    {topThreads.map((chat) => (
+                      <Link
+                        key={chat.chatId}
+                        href={threadHref(chat.chatId)}
+                        className="flex items-center justify-between gap-3 rounded-md transition-colors hover:text-ink"
+                      >
+                        <span className="truncate text-xs text-ink-tertiary">{chatLabel(chat)}</span>
+                        <span className="flex-none font-mono text-[11px] text-ink-faint">
+                          {formatCount(chat.messageCount)}
+                        </span>
+                      </Link>
+                    ))}
+                  </div>
+                ) : (
+                  <EmptyNote>No threads in this range.</EmptyNote>
+                )}
+              </Panel>
+
+              {messagesPerCall !== null || missedCallLeader ? (
+                <Panel delay={0.42} tint="accent" className="rounded-[20px] px-5 py-[18px]">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-accent">Insight</p>
+                  <p className="mt-2 text-[13px] leading-[1.5] text-ink-secondary">
+                    {messagesPerCall !== null ? (
+                      <>
+                        You exchange{" "}
+                        <span className="font-semibold text-ink">≈ {messagesPerCall.toFixed(1)} messages</span> for every
+                        call.{" "}
+                      </>
+                    ) : null}
+                    {missedCallLeader ? (
+                      <>
+                        <span className="font-semibold text-ink">{missedCallLeader.label}</span> has the most missed
+                        incoming calls —{" "}
+                        <span className="font-semibold text-ink">
+                          {formatCount(missedCallLeader.missedIncoming)} in this range
+                        </span>
+                        .
+                      </>
+                    ) : null}
+                  </p>
+                </Panel>
+              ) : null}
+            </div>
+          </div>
+        </>
+      )}
+    </>
   );
 }

@@ -1,14 +1,38 @@
-'use client';
+"use client";
 
 import Link from "next/link";
-import { useCallback, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { GlobalRangeBar } from "@/components/global-range-bar";
-import { PersonDrawer, type PersonCallStats, type PersonMessageStats, type PersonMessageThread, type PersonRecentCall } from "@/components/person-drawer";
+import { PageHeader, PRESET_LABELS, RangeControl } from "@/components/app-shell";
+import {
+  AxisLabels,
+  Avatar,
+  EmptyNote,
+  ErrorBanner,
+  MeterBar,
+  Panel,
+  PanelLabel,
+  PanelSubtitle,
+  PanelTitle,
+  Segmented,
+  SkeletonPanel,
+  Sparkline,
+  StatBadge,
+  StatCard,
+} from "@/components/ui/primitives";
 import { useGlobalRange } from "@/hooks/use-global-range";
-import { useStatsSummary } from "@/hooks/use-stats-summary";
-import type { SerializableConversationStats as ConversationStats } from "@/lib/imessage/types";
+import {
+  formatCount,
+  formatDateTime,
+  formatDayLong,
+  formatDayShort,
+  formatDuration,
+  formatPercent,
+  share,
+  toDate,
+} from "@/lib/format";
 import {
   type CallApiRecord,
   type CallDirection,
@@ -17,173 +41,253 @@ import {
   type CallProvider,
   fetchAllCalls,
 } from "@/lib/callhistory/client";
+
+/* ------------------------------------------------------------------ *
+ * Filter + sort state
+ * ------------------------------------------------------------------ */
+
+type ProviderFilter = "all" | CallProvider;
+type MediaFilter = "all" | CallMedia;
+type DirectionFilter = "all" | CallDirection;
 type AnsweredFilter = "all" | "answered" | "missed";
-type RankingMode = "calls" | "duration" | "outgoing" | "missed";
+type RankingMode = "duration" | "calls" | "outgoing" | "missed";
 
-const rankingModeLabels: Record<RankingMode, string> = {
-  duration: "talk time",
-  calls: "call count",
-  outgoing: "outgoing calls",
-  missed: "missed incoming calls",
-};
+const PROVIDER_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "facetime", label: "FaceTime" },
+  { value: "telephony", label: "Phone" },
+] as const satisfies ReadonlyArray<{ value: ProviderFilter; label: string }>;
 
-function formatNumber(value: number) {
-  return value.toLocaleString();
+const MEDIA_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "audio", label: "Audio" },
+  { value: "video", label: "Video" },
+] as const satisfies ReadonlyArray<{ value: MediaFilter; label: string }>;
+
+const DIRECTION_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "incoming", label: "Incoming" },
+  { value: "outgoing", label: "Outgoing" },
+] as const satisfies ReadonlyArray<{ value: DirectionFilter; label: string }>;
+
+const OUTCOME_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "answered", label: "Answered" },
+  { value: "missed", label: "Missed" },
+] as const satisfies ReadonlyArray<{ value: AnsweredFilter; label: string }>;
+
+const RANKING_OPTIONS = [
+  { value: "duration", label: "Talk time" },
+  { value: "calls", label: "Calls" },
+  { value: "outgoing", label: "Outgoing" },
+  { value: "missed", label: "Missed" },
+] as const satisfies ReadonlyArray<{ value: RankingMode; label: string }>;
+
+/* ------------------------------------------------------------------ *
+ * Local helpers
+ * ------------------------------------------------------------------ */
+
+/** Widest daily window we will materialise, so "All time" can't blow up the loop. */
+const MAX_BUCKET_DAYS = 2200;
+/** Bars we are willing to draw; longer ranges get grouped into equal-width bins. */
+const MAX_BARS = 120;
+
+function durationOf(call: CallApiRecord) {
+  return Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
 }
 
-const compactFormatter = Intl.NumberFormat(undefined, {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
-
-function formatCompactNumber(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "—";
-  try {
-    return compactFormatter.format(value);
-  } catch {
-    return formatNumber(value);
-  }
+function startOfDay(date: Date) {
+  const copy = new Date(date);
+  copy.setHours(0, 0, 0, 0);
+  return copy;
 }
 
-function formatDuration(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
-  const wholeSeconds = Math.floor(seconds);
-  const mins = Math.floor(wholeSeconds / 60);
-  const hrs = Math.floor(mins / 60);
-  const remMins = mins % 60;
-  const remSecs = wholeSeconds % 60;
-  if (hrs > 0) return `${hrs}h ${remMins}m`;
-  if (mins > 0) return `${mins}m ${remSecs}s`;
-  return `${remSecs}s`;
+/** Local-time day key, so buckets line up with the dates we print. */
+function dayKey(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function parseDate(value: string | null) {
-  if (!value) return null;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return null;
-  return date;
-}
-
-function getParticipantLabel(participant: CallParticipant) {
+function participantLabel(participant: CallParticipant) {
   return participant.displayName?.trim() || participant.handle;
 }
 
-function formatCallTargets(call: CallApiRecord) {
-  const participants = call.participants.length
-    ? call.participants
-    : call.address
-      ? [{ handle: call.address, displayName: call.name }]
-      : [];
+/** Participants, falling back to the call's raw address when the join table is empty. */
+function participantsOf(call: CallApiRecord): CallParticipant[] {
+  if (call.participants.length > 0) {
+    // The join table carries a name only when macOS Contacts matched the handle.
+    // For a one-to-one call the record's own ZNAME identifies that same party, so
+    // prefer it over rendering a bare phone number.
+    if (call.participants.length === 1 && !call.participants[0].displayName?.trim() && call.name?.trim()) {
+      return [{ ...call.participants[0], displayName: call.name.trim() }];
+    }
+    return call.participants;
+  }
+  if (call.address) return [{ handle: call.address, displayName: call.name }];
+  return [];
+}
 
-  const labels = participants.map(getParticipantLabel).filter(Boolean);
+function callTargets(call: CallApiRecord) {
+  const labels = participantsOf(call).map(participantLabel).filter(Boolean);
   if (labels.length === 0) return "Unknown";
   if (labels.length <= 3) return labels.join(", ");
   return `${labels.slice(0, 2).join(", ")} +${labels.length - 2}`;
 }
 
-function PhoneIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className={className} focusable="false">
-      <path
-        fill="currentColor"
-        d="M6.6 10.8c1.5 2.9 3.8 5.2 6.7 6.7l2.2-2.2c.3-.3.8-.4 1.2-.2 1.3.5 2.7.8 4.1.8.7 0 1.2.5 1.2 1.2V21c0 .7-.5 1.2-1.2 1.2C10 22.2 1.8 14 1.8 3.2 1.8 2.5 2.3 2 3 2h3.5c.7 0 1.2.5 1.2 1.2 0 1.4.3 2.8.8 4.1.1.4 0 .9-.3 1.2l-2.6 2.3z"
-      />
-    </svg>
-  );
+function providerLabel(provider: CallProvider) {
+  if (provider === "facetime") return "FaceTime";
+  if (provider === "telephony") return "Phone";
+  return null;
 }
 
-function VideoIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className={className} focusable="false">
-      <path
-        fill="currentColor"
-        d="M15 8H5c-1.1 0-2 .9-2 2v4c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-1l4 3V6l-4 3V10c0-1.1-.9-2-2-2z"
-      />
-    </svg>
-  );
+function mediaLabel(media: CallMedia) {
+  if (media === "video") return "Video";
+  if (media === "audio") return "Audio";
+  return null;
 }
 
-function StatCard({
-  label,
-  value,
-  description,
-  tone = "neutral",
-}: {
-  label: string;
-  value: string;
-  description?: string;
-  tone?: "neutral" | "emerald" | "sky" | "violet" | "amber";
-}) {
-  const toneClasses: Record<typeof tone, { wrapper: string; value: string }> = {
-    neutral: {
-      wrapper: "border-neutral-800/70 bg-gradient-to-br from-neutral-950 via-neutral-950/80 to-neutral-900",
-      value: "text-white",
-    },
-    emerald: {
-      wrapper: "border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 via-neutral-950 to-neutral-950",
-      value: "text-emerald-200",
-    },
-    sky: {
-      wrapper: "border-sky-500/30 bg-gradient-to-br from-sky-500/10 via-neutral-950 to-neutral-950",
-      value: "text-sky-200",
-    },
-    violet: {
-      wrapper: "border-violet-500/30 bg-gradient-to-br from-violet-500/10 via-neutral-950 to-neutral-950",
-      value: "text-violet-100",
-    },
-    amber: {
-      wrapper: "border-amber-400/30 bg-gradient-to-br from-amber-400/10 via-neutral-950 to-neutral-950",
-      value: "text-amber-100",
-    },
-  };
-
-  return (
-    <div className={`rounded-2xl border p-5 shadow-lg shadow-black/25 ${toneClasses[tone].wrapper}`}>
-      <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">{label}</p>
-      <p className={`mt-3 text-3xl font-semibold ${toneClasses[tone].value}`}>{value}</p>
-      {description ? <p className="mt-1 text-sm text-neutral-300">{description}</p> : null}
-    </div>
-  );
+function directionLabel(direction: CallDirection) {
+  if (direction === "outgoing") return "↗ Outgoing";
+  if (direction === "incoming") return "↙ Incoming";
+  return "Unknown direction";
 }
 
-function computeDailyBuckets(calls: CallApiRecord[], { end, days }: { end: Date; days: number }) {
-  const bucketEnd = end;
-  const start = new Date(bucketEnd.getTime() - days * 24 * 60 * 60 * 1000);
-  const buckets = new Map<string, { date: Date; count: number }>();
+type DayBucket = { date: Date; count: number; duration: number };
 
-  for (const call of calls) {
-    const startedAt = parseDate(call.startedAt);
-    if (!startedAt) continue;
-    if (startedAt < start) continue;
-    if (startedAt > bucketEnd) continue;
-    const key = startedAt.toISOString().slice(0, 10);
-    const existing = buckets.get(key);
-    if (existing) {
-      existing.count += 1;
-      continue;
-    }
-    const date = new Date(startedAt);
-    date.setHours(0, 0, 0, 0);
-    buckets.set(key, { date, count: 1 });
+/**
+ * One bucket per day across [start, end] — dense, so gaps read as gaps.
+ * Calls are already range-filtered by the caller.
+ */
+function computeDailyBuckets(
+  calls: CallApiRecord[],
+  { start, end }: { start: Date | null; end: Date | null },
+): DayBucket[] {
+  if (!start || !end) return [];
+  const first = startOfDay(start);
+  const last = startOfDay(end);
+  if (last < first) return [];
+
+  const buckets = new Map<string, DayBucket>();
+  const cursor = new Date(first);
+  while (cursor <= last && buckets.size < MAX_BUCKET_DAYS) {
+    buckets.set(dayKey(cursor), { date: new Date(cursor), count: 0, duration: 0 });
+    cursor.setDate(cursor.getDate() + 1);
   }
 
-  return Array.from(buckets.values()).sort((a, b) => a.date.getTime() - b.date.getTime());
+  for (const call of calls) {
+    const startedAt = toDate(call.startedAt);
+    if (!startedAt) continue;
+    const bucket = buckets.get(dayKey(startedAt));
+    if (!bucket) continue;
+    bucket.count += 1;
+    bucket.duration += durationOf(call);
+  }
+
+  return Array.from(buckets.values());
 }
 
+type Bar = { label: string; count: number; days: number };
+
+/** Collapse daily buckets to at most MAX_BARS equal-width bins. */
+function toBars(buckets: DayBucket[]): { bars: Bar[]; daysPerBar: number } {
+  if (buckets.length === 0) return { bars: [], daysPerBar: 1 };
+  const daysPerBar = Math.max(1, Math.ceil(buckets.length / MAX_BARS));
+  if (daysPerBar === 1) {
+    return {
+      bars: buckets.map((bucket) => ({ label: formatDayShort(bucket.date), count: bucket.count, days: 1 })),
+      daysPerBar,
+    };
+  }
+  const bars: Bar[] = [];
+  for (let i = 0; i < buckets.length; i += daysPerBar) {
+    const slice = buckets.slice(i, i + daysPerBar);
+    bars.push({
+      label: formatDayShort(slice[0].date),
+      count: slice.reduce((sum, bucket) => sum + bucket.count, 0),
+      days: slice.length,
+    });
+  }
+  return { bars, daysPerBar };
+}
+
+type PersonStat = {
+  key: string;
+  label: string;
+  calls: number;
+  answered: number;
+  missed: number;
+  missedIncoming: number;
+  incoming: number;
+  outgoing: number;
+  totalDuration: number;
+  lastCallAt: Date | null;
+};
+
+function personMetric(person: PersonStat, mode: RankingMode) {
+  if (mode === "calls") return person.calls;
+  if (mode === "outgoing") return person.outgoing;
+  if (mode === "missed") return person.missedIncoming;
+  return person.totalDuration;
+}
+
+/* ------------------------------------------------------------------ *
+ * Local presentation bits
+ * ------------------------------------------------------------------ */
+
+/** Mono meta line under a stat number. */
+function Meta({ children }: { children: ReactNode }) {
+  return <p className="font-mono text-[10px] text-ink-dim">{children}</p>;
+}
+
+/** The 4-up highlight card: small label, mid-size value, mono sub-line. */
+function MiniCard({
+  label,
+  value,
+  sub,
+  valueClass = "text-ink",
+  delay,
+}: {
+  label: string;
+  value: ReactNode;
+  sub: ReactNode;
+  valueClass?: string;
+  delay?: number;
+}) {
+  return (
+    <Panel delay={delay} className="rounded-2xl px-4 py-[15px]">
+      <p className="text-[11px] text-ink-dim">{label}</p>
+      <p className={`mt-1.5 text-[19px] font-semibold ${valueClass}`}>{value}</p>
+      <p className="mt-1 truncate font-mono text-[10px] text-ink-faint">{sub}</p>
+    </Panel>
+  );
+}
+
+function PagerButton({ onClick, children }: { onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="cursor-pointer rounded-[7px] border border-line-control px-2.5 py-1 text-[11px] font-semibold text-ink-muted transition-colors hover:bg-surface-hover hover:text-ink"
+    >
+      {children}
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Screen
+ * ------------------------------------------------------------------ */
+
 export default function CallsDashboard() {
-  const { range, searchParams } = useGlobalRange();
-  const preservedQuery = searchParams.toString();
-  const querySuffix = preservedQuery ? `?${preservedQuery}` : "";
-  const overviewHref = `/${querySuffix}`;
-  const messagesHref = `/messages${querySuffix}`;
-  const callsHref = `/calls${querySuffix}`;
-  const [provider, setProvider] = useState<"all" | CallProvider>("all");
-  const [media, setMedia] = useState<"all" | CallMedia>("all");
-  const [direction, setDirection] = useState<"all" | CallDirection>("all");
+  const { range } = useGlobalRange();
+  const searchParams = useSearchParams();
+
+  const [provider, setProvider] = useState<ProviderFilter>("all");
+  const [media, setMedia] = useState<MediaFilter>("all");
+  const [direction, setDirection] = useState<DirectionFilter>("all");
   const [answeredFilter, setAnsweredFilter] = useState<AnsweredFilter>("all");
   const [rankingMode, setRankingMode] = useState<RankingMode>("duration");
-  const [selectedPersonKey, setSelectedPersonKey] = useState<string | null>(null);
 
+  // Paging resets when the slice changes, but is remembered per slice.
   const recentLimitKey = useMemo(() => {
     return JSON.stringify({
       provider,
@@ -210,6 +314,8 @@ export default function CallsDashboard() {
     [recentLimitKey],
   );
 
+  // The call history API has no range parameters — it pages the whole log, and we
+  // slice client-side. Ordered newest-first by the query layer.
   const callsQuery = useQuery({
     queryKey: ["calls", "all"],
     queryFn: fetchAllCalls,
@@ -217,37 +323,20 @@ export default function CallsDashboard() {
     gcTime: 5 * 60_000,
     refetchOnWindowFocus: true,
     retry: 1,
+    // This route is same-origin and reads a local SQLite file, so the default
+    // "online" network mode is wrong for it: when the online heuristic reads
+    // false, a failed attempt is paused rather than retried, and the query sits
+    // in `pending` forever — the skeleton never resolves and a real failure
+    // (e.g. no Full Disk Access) never surfaces.
+    networkMode: "always",
   });
 
-  const allCalls = callsQuery.data ?? [];
-  const callHistoryEarliest = useMemo(() => {
-    let earliest: Date | null = null;
-    for (const call of allCalls) {
-      const startedAt = parseDate(call.startedAt);
-      if (!startedAt) continue;
-      if (!earliest || startedAt < earliest) {
-        earliest = startedAt;
-      }
-    }
-    return earliest;
-  }, [allCalls]);
+  const allCalls = useMemo(() => callsQuery.data ?? [], [callsQuery.data]);
 
-  const messagesQueryInput = useMemo(() => {
-    return {
-      limit: 50,
-      start: range.startIso,
-      end: range.endIso,
-    } as const;
-  }, [range.endIso, range.startIso]);
-
-  const messagesQuery = useStatsSummary(messagesQueryInput, {
-    enabled: Boolean(selectedPersonKey),
-  });
-  const messagesStats = (messagesQuery.data as ConversationStats | undefined) ?? null;
-
-  const rangeBounds = useMemo(() => {
-    return { start: range.startDate, end: range.endDate };
-  }, [range.endDate, range.startDate]);
+  const rangeBounds = useMemo(
+    () => ({ start: range.startDate, end: range.endDate }),
+    [range.endDate, range.startDate],
+  );
 
   const filteredCalls = useMemo(() => {
     return allCalls.filter((call) => {
@@ -258,7 +347,7 @@ export default function CallsDashboard() {
       if (answeredFilter === "missed" && call.answered) return false;
 
       if (rangeBounds.start || rangeBounds.end) {
-        const startedAt = parseDate(call.startedAt);
+        const startedAt = toDate(call.startedAt);
         if (!startedAt) return false;
         if (rangeBounds.start && startedAt < rangeBounds.start) return false;
         if (rangeBounds.end && startedAt > rangeBounds.end) return false;
@@ -281,6 +370,7 @@ export default function CallsDashboard() {
     let audioCount = 0;
     let totalDuration = 0;
     let latest: Date | null = null;
+    let earliest: Date | null = null;
 
     for (const call of filteredCalls) {
       callCount += 1;
@@ -293,14 +383,15 @@ export default function CallsDashboard() {
       if (call.provider === "telephony") telephonyCount += 1;
       if (call.media === "video") videoCount += 1;
       if (call.media === "audio") audioCount += 1;
-      totalDuration += Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
+      totalDuration += durationOf(call);
 
-      const startedAt = parseDate(call.startedAt);
-      if (startedAt && (!latest || startedAt > latest)) latest = startedAt;
+      const startedAt = toDate(call.startedAt);
+      if (startedAt) {
+        if (!latest || startedAt > latest) latest = startedAt;
+        if (!earliest || startedAt < earliest) earliest = startedAt;
+      }
     }
 
-    const answeredRate = callCount > 0 ? answeredCount / callCount : 0;
-    const avgDuration = answeredCount > 0 ? totalDuration / answeredCount : 0;
     return {
       callCount,
       answeredCount,
@@ -313,47 +404,56 @@ export default function CallsDashboard() {
       videoCount,
       audioCount,
       totalDuration,
-      answeredRate,
-      avgDuration,
+      answeredRate: share(answeredCount, callCount),
+      avgDuration: answeredCount > 0 ? totalDuration / answeredCount : 0,
       latest,
+      earliest,
     };
   }, [filteredCalls]);
 
-  type PersonStat = {
-    key: string;
-    label: string;
-    calls: number;
-    answered: number;
-    missed: number;
-    missedIncoming: number;
-    incoming: number;
-    outgoing: number;
-    totalDuration: number;
-    lastCallAt: Date | null;
-  };
+  // Preset "all" has no bounds — fall back to the span the data actually covers.
+  const windowStart = rangeBounds.start ?? totals.earliest;
+  const windowEnd = rangeBounds.end ?? totals.latest;
+
+  const dailyBuckets = useMemo(
+    () => computeDailyBuckets(filteredCalls, { start: windowStart, end: windowEnd }),
+    [filteredCalls, windowEnd, windowStart],
+  );
+
+  const { bars, daysPerBar } = useMemo(() => toBars(dailyBuckets), [dailyBuckets]);
+  const barPeak = useMemo(() => bars.reduce((max, bar) => (bar.count > max ? bar.count : max), 0), [bars]);
+  const sparkValues = useMemo(() => bars.map((bar) => bar.count), [bars]);
+
+  /**
+   * The only trend the call log can honestly support: talk time in the second half
+   * of the visible range against the first half. Not a previous-period comparison.
+   */
+  const talkTrend = useMemo(() => {
+    if (dailyBuckets.length < 4) return null;
+    const mid = Math.floor(dailyBuckets.length / 2);
+    const first = dailyBuckets.slice(0, mid).reduce((sum, bucket) => sum + bucket.duration, 0);
+    const second = dailyBuckets.slice(mid).reduce((sum, bucket) => sum + bucket.duration, 0);
+    if (first <= 0) return null;
+    return (second - first) / first;
+  }, [dailyBuckets]);
 
   const peopleAggregate = useMemo(() => {
     const map = new Map<string, PersonStat>();
 
     for (const call of filteredCalls) {
-      const participants = call.participants.length
-        ? call.participants
-        : call.address
-          ? [{ handle: call.address, displayName: call.name }]
-          : [];
-
+      const participants = participantsOf(call);
       const participantKeys = new Set(
         participants.map((participant) => participant.id ?? participant.handle).filter(Boolean),
       );
-      const startedAt = parseDate(call.startedAt);
-      const duration = Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
+      const startedAt = toDate(call.startedAt);
+      const duration = durationOf(call);
       const missedIncoming = call.direction === "incoming" && !call.answered ? 1 : 0;
 
       for (const key of participantKeys) {
         const existing = map.get(key);
         const participant = participants.find((p) => (p.id ?? p.handle) === key);
         const handle = participant?.handle ?? key;
-        const label = participant ? getParticipantLabel(participant) : handle;
+        const label = participant ? participantLabel(participant) : handle;
         if (!existing) {
           map.set(key, {
             key,
@@ -394,10 +494,7 @@ export default function CallsDashboard() {
     const list = [...peopleAggregate];
     if (rankingMode === "calls") {
       return list.sort(
-        (a, b) =>
-          b.calls - a.calls ||
-          b.totalDuration - a.totalDuration ||
-          a.label.localeCompare(b.label),
+        (a, b) => b.calls - a.calls || b.totalDuration - a.totalDuration || a.label.localeCompare(b.label),
       );
     }
     if (rankingMode === "outgoing") {
@@ -419,681 +516,422 @@ export default function CallsDashboard() {
       );
     }
     return list.sort(
-      (a, b) =>
-        b.totalDuration - a.totalDuration ||
-        b.calls - a.calls ||
-        a.label.localeCompare(b.label),
+      (a, b) => b.totalDuration - a.totalDuration || b.calls - a.calls || a.label.localeCompare(b.label),
     );
   }, [peopleAggregate, rankingMode]);
 
-  const dailyBucketEnd = useMemo(() => rangeBounds.end ?? new Date(), [rangeBounds.end]);
-  const dailyBuckets = useMemo(
-    () => computeDailyBuckets(filteredCalls, { end: dailyBucketEnd, days: 30 }),
-    [dailyBucketEnd, filteredCalls],
+  const topPeople = useMemo(
+    () => rankedPeople.filter((person) => personMetric(person, rankingMode) > 0).slice(0, 8),
+    [rankedPeople, rankingMode],
   );
-  const dailyMax = useMemo(
-    () => dailyBuckets.reduce((max, bucket) => (bucket.count > max ? bucket.count : max), 0),
-    [dailyBuckets],
-  );
+  const topPeopleMax = topPeople.length > 0 ? personMetric(topPeople[0], rankingMode) : 0;
 
   const highlights = useMemo(() => {
     const longestCall = filteredCalls.reduce<CallApiRecord | null>((best, call) => {
-      const duration = Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0;
+      const duration = durationOf(call);
       if (duration <= 0) return best;
       if (!best) return call;
-      return duration > best.durationSeconds ? call : best;
+      return duration > durationOf(best) ? call : best;
     }, null);
 
-    const busiestDay = dailyBuckets.reduce<{ date: Date; count: number } | null>((best, bucket) => {
+    const busiestDay = dailyBuckets.reduce<DayBucket | null>((best, bucket) => {
+      if (bucket.count === 0) return best;
       if (!best) return bucket;
       return bucket.count > best.count ? bucket : best;
     }, null);
 
-    const mostOutgoing = [...peopleAggregate]
-      .sort((a, b) => b.outgoing - a.outgoing || b.calls - a.calls || a.label.localeCompare(b.label))
-      .find((person) => person.outgoing > 0) ?? null;
+    const mostOutgoing =
+      [...peopleAggregate]
+        .sort((a, b) => b.outgoing - a.outgoing || b.calls - a.calls || a.label.localeCompare(b.label))
+        .find((person) => person.outgoing > 0) ?? null;
 
-    const mostMissedIncoming = [...peopleAggregate]
-      .sort(
-        (a, b) =>
-          b.missedIncoming - a.missedIncoming || b.calls - a.calls || a.label.localeCompare(b.label),
-      )
-      .find((person) => person.missedIncoming > 0) ?? null;
+    const mostMissedIncoming =
+      [...peopleAggregate]
+        .sort(
+          (a, b) => b.missedIncoming - a.missedIncoming || b.calls - a.calls || a.label.localeCompare(b.label),
+        )
+        .find((person) => person.missedIncoming > 0) ?? null;
 
-    return {
-      longestCall,
-      busiestDay,
-      mostOutgoing,
-      mostMissedIncoming,
-    };
+    return { longestCall, busiestDay, mostOutgoing, mostMissedIncoming };
   }, [dailyBuckets, filteredCalls, peopleAggregate]);
 
   const recentCalls = useMemo(() => filteredCalls.slice(0, recentLimit), [filteredCalls, recentLimit]);
   const hasMoreRecent = recentLimit < filteredCalls.length;
 
-  const accessError = callsQuery.error ? (callsQuery.error as Error).message : null;
+  const personHref = useCallback(
+    (person: PersonStat) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("key", person.key);
+      params.set("label", person.label);
+      return `/people?${params.toString()}`;
+    },
+    [searchParams],
+  );
 
-  const buildReportUrl = useMemo(() => {
-    const params = new URLSearchParams();
-    if (range.startIso) params.set("start", range.startIso);
-    if (range.endIso) params.set("end", range.endIso);
-    const query = params.toString();
-    return (chatId: number) => `/reports/${chatId}${query ? `?${query}` : ""}`;
-  }, [range.endIso, range.startIso]);
+  const rangeLabel =
+    range.mode === "preset" ? PRESET_LABELS[range.preset] : range.mode === "day" ? "Single day" : "Custom range";
 
-  const selectedCallSummary = useMemo(() => {
-    if (!selectedPersonKey) return null;
-    return peopleAggregate.find((person) => person.key === selectedPersonKey) ?? null;
-  }, [peopleAggregate, selectedPersonKey]);
+  const spanLabel =
+    windowStart && windowEnd ? `${formatDayLong(windowStart)} – ${formatDayLong(windowEnd)}` : null;
 
-  const selectedPerson = useMemo(() => {
-    if (!selectedPersonKey) return null;
-    return {
-      key: selectedPersonKey,
-      label: selectedCallSummary?.label ?? "Unknown",
-    };
-  }, [selectedCallSummary?.label, selectedPersonKey]);
+  const subtitle = (
+    <>
+      {rangeLabel}
+      {spanLabel ? ` · ${spanLabel}` : null} ·{" "}
+      <span className="text-ink-muted">
+        {formatCount(filteredCalls.length)} calls
+        {totals.latest ? ` · latest ${formatDateTime(totals.latest)}` : null}
+      </span>
+    </>
+  );
 
-  const selectedRecentCalls = useMemo<PersonRecentCall[]>(() => {
-    if (!selectedPersonKey) return [];
-    const matches: PersonRecentCall[] = [];
-    for (const call of filteredCalls) {
-      const participants = call.participants.length
-        ? call.participants
-        : call.address
-          ? [{ handle: call.address, displayName: call.name }]
-          : [];
-      const keys = new Set(
-        participants.map((participant) => participant.id ?? participant.handle).filter(Boolean),
-      );
-      if (!keys.has(selectedPersonKey)) continue;
-      matches.push({
-        callId: call.callId,
-        startedAt: parseDate(call.startedAt),
-        durationSeconds: Number.isFinite(call.durationSeconds) ? Math.max(0, call.durationSeconds) : 0,
-        answered: call.answered,
-        direction: call.direction,
-        provider: call.provider,
-        media: call.media,
-      });
-    }
-    matches.sort(
-      (a, b) =>
-        (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0) ||
-        b.callId - a.callId,
+  const accessError = callsQuery.error instanceof Error ? callsQuery.error.message : null;
+  // A query whose retry is paused reports `pending` with no error, forever. Never
+  // let that state render as an endless skeleton — say what is actually going on.
+  const isStalled = callsQuery.fetchStatus === "paused" && callsQuery.data === undefined;
+
+  /* ---------------------------------------------------------------- *
+   * Loading / error
+   * ---------------------------------------------------------------- */
+
+  if (callsQuery.isPending && !isStalled) {
+    return (
+      <>
+        <PageHeader title="Calls" subtitle="Loading call history…" actions={<RangeControl />} />
+        <SkeletonPanel height={58} className="rounded-2xl" />
+        <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <SkeletonPanel key={`stat-${i}`} height={118} />
+          ))}
+        </div>
+        <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <SkeletonPanel key={`mini-${i}`} height={92} className="rounded-2xl" />
+          ))}
+        </div>
+        <div className="grid gap-3.5 lg:grid-cols-[1.55fr_1fr]">
+          <SkeletonPanel height={330} className="rounded-[20px]" />
+          <SkeletonPanel height={330} className="rounded-[20px]" />
+        </div>
+        <SkeletonPanel height={340} className="rounded-[20px]" />
+      </>
     );
-    return matches;
-  }, [filteredCalls, selectedPersonKey]);
+  }
 
-  const selectedCallStats = useMemo<PersonCallStats | null>(() => {
-    if (!selectedCallSummary) return null;
-    return {
-      totalCalls: selectedCallSummary.calls,
-      incomingCalls: selectedCallSummary.incoming,
-      outgoingCalls: selectedCallSummary.outgoing,
-      answeredCalls: selectedCallSummary.answered,
-      missedIncomingCalls: selectedCallSummary.missedIncoming,
-      talkSeconds: selectedCallSummary.totalDuration,
-      lastCallAt: selectedCallSummary.lastCallAt,
-      recentCalls: selectedRecentCalls.slice(0, 8),
-      callsInRange: selectedRecentCalls,
-    };
-  }, [selectedCallSummary, selectedRecentCalls]);
-
-  const selectedMessageStats = useMemo<PersonMessageStats | null>(() => {
-    if (!selectedPersonKey || !messagesStats) return null;
-    let totalMessages = 0;
-    let fromMeMessages = 0;
-    let fromThemMessages = 0;
-    let lastMessageAt: Date | null = null;
-    const chatIds = new Set<number>();
-    const threads: PersonMessageThread[] = [];
-
-    for (const chat of messagesStats.topChats ?? []) {
-      const mySent = Math.max(0, chat.sentCount ?? 0);
-      const participant = (chat.messageParticipants ?? []).find((p) => {
-        const isSelf = Boolean(p.isMe || p.id === "me");
-        if (isSelf) return false;
-        const key = p.id ?? p.displayName ?? `unknown-${chat.chatId}`;
-        return key === selectedPersonKey;
-      });
-      if (!participant) continue;
-
-      const fromThem = Math.max(0, participant.messageCount ?? 0);
-      const total = mySent + fromThem;
-      totalMessages += total;
-      fromMeMessages += mySent;
-      fromThemMessages += fromThem;
-      chatIds.add(chat.chatId);
-
-      const chatLast = parseDate(chat.lastMessageAt ?? null);
-      if (chatLast && (!lastMessageAt || chatLast > lastMessageAt)) {
-        lastMessageAt = chatLast;
-      }
-
-      const label =
-        chat.chatDisplayName ??
-        (chat.participants.length > 0 ? chat.participants.join(", ") : `Chat ${chat.chatId}`);
-      threads.push({
-        chatId: chat.chatId,
-        label,
-        isGroup: Boolean(chat.isGroup),
-        totalMessages: total,
-        fromMeMessages: mySent,
-        fromThemMessages: fromThem,
-        lastMessageAt: chatLast,
-        href: buildReportUrl(chat.chatId),
-      });
-    }
-
-    threads.sort(
-      (a, b) =>
-        b.totalMessages - a.totalMessages ||
-        (b.lastMessageAt?.getTime() ?? 0) - (a.lastMessageAt?.getTime() ?? 0) ||
-        a.label.localeCompare(b.label),
+  if (accessError || isStalled) {
+    return (
+      <>
+        <PageHeader title="Calls" actions={<RangeControl />} />
+        {accessError ? (
+          <ErrorBanner
+            title="Can’t read Call History"
+            detail={`${accessError} Grant your terminal “Full Disk Access” (System Settings → Privacy & Security), then refresh.`}
+          />
+        ) : (
+          <ErrorBanner
+            title="Call history didn’t load"
+            detail="The request was paused before it could finish. Check that the app is online, then refresh."
+          />
+        )}
+      </>
     );
+  }
 
-    return {
-      totalMessages,
-      fromMeMessages,
-      fromThemMessages,
-      chatCount: chatIds.size,
-      lastMessageAt,
-      threads: threads.slice(0, 8),
-    };
-  }, [buildReportUrl, messagesStats, selectedPersonKey]);
+  /* ---------------------------------------------------------------- *
+   * Screen
+   * ---------------------------------------------------------------- */
 
-  const messagesError =
-    messagesQuery.error instanceof Error
-      ? messagesQuery.error.message
-      : messagesQuery.error
-        ? "Unable to load messages."
-        : null;
+  const filtersBar = (
+    <Panel className="flex flex-wrap items-center gap-2.5 rounded-2xl px-4 py-3.5">
+      <PanelLabel className="mr-1">Filters</PanelLabel>
+      <Segmented options={PROVIDER_OPTIONS} value={provider} onChange={setProvider} ariaLabel="Provider" />
+      <Segmented options={MEDIA_OPTIONS} value={media} onChange={setMedia} ariaLabel="Media" />
+      <Segmented options={DIRECTION_OPTIONS} value={direction} onChange={setDirection} ariaLabel="Direction" />
+      <Segmented options={OUTCOME_OPTIONS} value={answeredFilter} onChange={setAnsweredFilter} ariaLabel="Outcome" />
+    </Panel>
+  );
+
+  if (filteredCalls.length === 0) {
+    return (
+      <>
+        <PageHeader title="Calls" subtitle={subtitle} actions={<RangeControl />} />
+        {filtersBar}
+        <Panel className="rounded-[20px] px-[22px] py-6">
+          <PanelTitle>No calls in this view</PanelTitle>
+          <PanelSubtitle>
+            {allCalls.length === 0
+              ? "The call history database is empty."
+              : "Nothing matches these filters in the selected range. Widen the range or clear a filter."}
+          </PanelSubtitle>
+        </Panel>
+      </>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-neutral-950 pb-16 text-neutral-100">
-      <header className="border-b border-neutral-900/60 bg-neutral-950/95 py-6">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-6">
+    <>
+      <PageHeader title="Calls" subtitle={subtitle} actions={<RangeControl />} />
+
+      {filtersBar}
+
+      {/* Six headline metrics */}
+      <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
+        <StatCard
+          label="Calls"
+          value={formatCount(totals.callCount)}
+          delay={0.02}
+          badge={<StatBadge tint="accent">{formatPercent(totals.answeredRate)} connected</StatBadge>}
+          footer={
+            sparkValues.length >= 2 ? (
+              <Sparkline values={sparkValues} color="var(--ink-secondary)" delay={0.1} />
+            ) : null
+          }
+        />
+        <StatCard
+          label="Talk time"
+          tint="accent"
+          value={formatDuration(totals.totalDuration)}
+          delay={0.06}
+          badge={
+            talkTrend === null ? undefined : (
+              <StatBadge tint={talkTrend >= 0 ? "accent" : "rose"}>
+                {talkTrend >= 0 ? "▲" : "▼"} {formatPercent(Math.abs(talkTrend), 1)} vs 1st half
+              </StatBadge>
+            )
+          }
+          footer={
+            <Meta>
+              {totals.answeredCount > 0
+                ? `Avg · ${formatDuration(totals.avgDuration)} / answered`
+                : "No answered calls"}
+            </Meta>
+          }
+        />
+        <StatCard
+          label="Missed"
+          tint="amber"
+          value={formatCount(totals.missedCount)}
+          delay={0.1}
+          badge={<StatBadge tint="amber">{formatPercent(share(totals.missedCount, totals.callCount))}</StatBadge>}
+          footer={<Meta>{formatCount(totals.missedIncomingCount)} incoming · not answered</Meta>}
+        />
+        <StatCard
+          label="Outgoing"
+          tint="sky"
+          value={formatCount(totals.outgoingCount)}
+          delay={0.14}
+          badge={<StatBadge tint="sky">{formatPercent(share(totals.outgoingCount, totals.callCount))}</StatBadge>}
+          footer={<Meta>{formatCount(totals.incomingCount)} incoming</Meta>}
+        />
+        <StatCard
+          label="FaceTime"
+          tint="violet"
+          value={formatCount(totals.facetimeCount)}
+          delay={0.18}
+          badge={
+            <StatBadge tint="violet">{formatPercent(share(totals.facetimeCount, totals.callCount))}</StatBadge>
+          }
+          footer={<Meta>{formatCount(totals.telephonyCount)} phone</Meta>}
+        />
+        <StatCard
+          label="Video"
+          value={formatCount(totals.videoCount)}
+          delay={0.22}
+          badge={<StatBadge>{formatPercent(share(totals.videoCount, totals.callCount))}</StatBadge>}
+          footer={<Meta>{formatCount(totals.audioCount)} audio</Meta>}
+        />
+      </div>
+
+      {/* Four highlights */}
+      <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-4">
+        <MiniCard
+          label="Longest call"
+          delay={0.24}
+          value={highlights.longestCall ? formatDuration(durationOf(highlights.longestCall)) : "—"}
+          sub={
+            highlights.longestCall
+              ? `${callTargets(highlights.longestCall)} · ${formatDayShort(highlights.longestCall.startedAt)}`
+              : "No calls with a duration"
+          }
+        />
+        <MiniCard
+          label="Busiest day"
+          delay={0.28}
+          value={
+            highlights.busiestDay
+              ? `${formatCount(highlights.busiestDay.count)} ${highlights.busiestDay.count === 1 ? "call" : "calls"}`
+              : "—"
+          }
+          sub={highlights.busiestDay ? formatDayLong(highlights.busiestDay.date) : "—"}
+        />
+        <MiniCard
+          label="Most outgoing"
+          delay={0.32}
+          value={highlights.mostOutgoing ? formatCount(highlights.mostOutgoing.outgoing) : "—"}
+          sub={highlights.mostOutgoing ? highlights.mostOutgoing.label : "No outgoing calls"}
+        />
+        <MiniCard
+          label="Most missed (in)"
+          delay={0.36}
+          valueClass="text-amber-soft"
+          value={highlights.mostMissedIncoming ? formatCount(highlights.mostMissedIncoming.missedIncoming) : "—"}
+          sub={highlights.mostMissedIncoming ? highlights.mostMissedIncoming.label : "No missed incoming calls"}
+        />
+      </div>
+
+      {/* Top people + daily calls */}
+      <div className="grid gap-3.5 lg:grid-cols-[1.55fr_1fr]">
+        <Panel delay={0.38} className="rounded-[20px] px-[22px] py-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <Link
-                href={overviewHref}
-                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
-              >
-                Overview
-              </Link>
-              <Link
-                href={messagesHref}
-                className="rounded-full border border-neutral-800/80 bg-neutral-900/60 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
-              >
-                Messages
-              </Link>
-              <Link
-                href={callsHref}
-                className="rounded-full border border-neutral-800/80 bg-white/5 px-3 py-1 text-xs font-semibold text-white"
-              >
-                Calls
-              </Link>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400">
-              <span className="rounded-full border border-neutral-800/70 bg-neutral-900/40 px-3 py-1">
-                {callsQuery.isPending ? "Loading…" : `${formatNumber(filteredCalls.length)} calls`}
-              </span>
-              {totals.latest ? (
-                <span className="rounded-full border border-neutral-800/70 bg-neutral-900/40 px-3 py-1">
-                  Latest · {totals.latest.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
-                </span>
-              ) : null}
-            </div>
+            <PanelTitle>Top people</PanelTitle>
+            <Segmented
+              options={RANKING_OPTIONS}
+              value={rankingMode}
+              onChange={setRankingMode}
+              ariaLabel="Rank people by"
+            />
           </div>
 
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-white">Calls</h1>
-          </div>
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-6xl space-y-8 px-6 py-10">
-        <GlobalRangeBar />
-        <section className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-          <div className="flex flex-wrap items-end justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Filters</p>
-              <p className="mt-1 text-sm text-neutral-300">Slice by provider, media type, direction, and outcome.</p>
-            </div>
-            <button
-              type="button"
-              onClick={() => callsQuery.refetch()}
-              className="inline-flex items-center justify-center rounded-full border border-neutral-800/80 bg-neutral-900/70 px-4 py-2 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={callsQuery.isFetching}
-            >
-              {callsQuery.isFetching ? "Refreshing…" : "Refresh"}
-            </button>
-          </div>
-
-          <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <label className="space-y-1">
-              <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Provider</span>
-              <select
-                value={provider}
-                onChange={(event) => setProvider(event.target.value as typeof provider)}
-                className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-400/40 transition focus:ring-2"
-              >
-                <option value="all">All</option>
-                <option value="facetime">FaceTime</option>
-                <option value="telephony">Phone</option>
-              </select>
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Media</span>
-              <select
-                value={media}
-                onChange={(event) => setMedia(event.target.value as typeof media)}
-                className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-400/40 transition focus:ring-2"
-              >
-                <option value="all">All</option>
-                <option value="audio">Audio</option>
-                <option value="video">Video</option>
-              </select>
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Direction</span>
-              <select
-                value={direction}
-                onChange={(event) => setDirection(event.target.value as typeof direction)}
-                className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-400/40 transition focus:ring-2"
-              >
-                <option value="all">All</option>
-                <option value="incoming">Incoming</option>
-                <option value="outgoing">Outgoing</option>
-              </select>
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Outcome</span>
-              <select
-                value={answeredFilter}
-                onChange={(event) => setAnsweredFilter(event.target.value as AnsweredFilter)}
-                className="w-full rounded-xl border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none ring-emerald-400/40 transition focus:ring-2"
-              >
-                <option value="all">All</option>
-                <option value="answered">Answered</option>
-                <option value="missed">Missed / no answer</option>
-              </select>
-            </label>
-          </div>
-
-          {accessError ? (
-            <div className="mt-5 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100">
-              <p className="font-semibold text-amber-200">Can’t read Call History</p>
-              <p className="mt-1 text-amber-100/90">
-                {accessError} Grant your terminal “Full Disk Access” (System Settings → Privacy &amp; Security) and refresh.
-              </p>
-            </div>
-          ) : null}
-        </section>
-
-        <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
-          <StatCard
-            label="Calls"
-            value={callsQuery.isPending ? "—" : formatCompactNumber(totals.callCount)}
-            description={callsQuery.isPending ? "Loading history" : `${Math.round(totals.answeredRate * 100)}% connected`}
-            tone="neutral"
-          />
-          <StatCard
-            label="Talk time"
-            value={callsQuery.isPending ? "—" : formatDuration(totals.totalDuration)}
-            description={totals.answeredCount > 0 ? `Avg · ${formatDuration(totals.avgDuration)}` : "No answered calls"}
-            tone="emerald"
-          />
-          <StatCard
-            label="Missed"
-            value={callsQuery.isPending ? "—" : formatCompactNumber(totals.missedIncomingCount)}
-            description={`${formatNumber(totals.missedCount)} not answered`}
-            tone="amber"
-          />
-          <StatCard
-            label="Outgoing"
-            value={callsQuery.isPending ? "—" : formatCompactNumber(totals.outgoingCount)}
-            description={`${formatNumber(totals.incomingCount)} incoming`}
-            tone="sky"
-          />
-          <StatCard
-            label="FaceTime"
-            value={callsQuery.isPending ? "—" : formatCompactNumber(totals.facetimeCount)}
-            description={`${formatNumber(totals.telephonyCount)} phone`}
-            tone="violet"
-          />
-          <StatCard
-            label="Video"
-            value={callsQuery.isPending ? "—" : formatCompactNumber(totals.videoCount)}
-            description={`${formatNumber(totals.audioCount)} audio`}
-            tone="amber"
-          />
-        </section>
-
-        <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard
-            label="Longest call"
-            value={
-              highlights.longestCall
-                ? formatDuration(highlights.longestCall.durationSeconds)
-                : "—"
-            }
-            description={
-              highlights.longestCall
-                ? (() => {
-                    const startedAt = parseDate(highlights.longestCall.startedAt);
-                    const when = startedAt
-                      ? startedAt.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
-                      : "Unknown date";
-                    return `${formatCallTargets(highlights.longestCall)} · ${when}`;
-                  })()
-                : "—"
-            }
-            tone="neutral"
-          />
-          <StatCard
-            label="Busiest day (30d)"
-            value={highlights.busiestDay ? formatNumber(highlights.busiestDay.count) : "—"}
-            description={
-              highlights.busiestDay
-                ? highlights.busiestDay.date.toLocaleDateString(undefined, { dateStyle: "medium" })
-                : "—"
-            }
-            tone="neutral"
-          />
-          <StatCard
-            label="Most outgoing"
-            value={highlights.mostOutgoing ? formatNumber(highlights.mostOutgoing.outgoing) : "—"}
-            description={highlights.mostOutgoing ? highlights.mostOutgoing.label : "—"}
-            tone="neutral"
-          />
-          <StatCard
-            label="Most missed (in)"
-            value={
-              highlights.mostMissedIncoming ? formatNumber(highlights.mostMissedIncoming.missedIncoming) : "—"
-            }
-            description={highlights.mostMissedIncoming ? highlights.mostMissedIncoming.label : "—"}
-            tone="neutral"
-          />
-        </section>
-
-        <section className="grid gap-6 lg:grid-cols-2">
-          <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-            <div className="flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Top people</p>
-                <p className="mt-1 text-sm text-neutral-300">
-                  Ranked by {rankingModeLabels[rankingMode]}.
-                </p>
-              </div>
-              <div className="flex items-center gap-2 rounded-full border border-neutral-800/80 bg-neutral-900/60 p-1 text-xs">
-                <button
-                  type="button"
-                  onClick={() => setRankingMode("duration")}
-                  className={`rounded-full px-3 py-1 font-semibold transition ${
-                    rankingMode === "duration" ? "bg-white/10 text-white" : "text-neutral-300 hover:text-white"
-                  }`}
-                >
-                  Talk time
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRankingMode("calls")}
-                  className={`rounded-full px-3 py-1 font-semibold transition ${
-                    rankingMode === "calls" ? "bg-white/10 text-white" : "text-neutral-300 hover:text-white"
-                  }`}
-                >
-                  Calls
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRankingMode("outgoing")}
-                  className={`rounded-full px-3 py-1 font-semibold transition ${
-                    rankingMode === "outgoing" ? "bg-white/10 text-white" : "text-neutral-300 hover:text-white"
-                  }`}
-                >
-                  Outgoing
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRankingMode("missed")}
-                  className={`rounded-full px-3 py-1 font-semibold transition ${
-                    rankingMode === "missed" ? "bg-white/10 text-white" : "text-neutral-300 hover:text-white"
-                  }`}
-                >
-                  Missed
-                </button>
-              </div>
-            </div>
-
-            <ul className="mt-4 space-y-3">
-              {callsQuery.isPending ? (
-                Array.from({ length: 8 }).map((_, index) => (
-                  <li key={`person-skel-${index}`} className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-3">
-                    <div className="h-3 w-40 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="mt-2 h-3 w-56 animate-pulse rounded bg-neutral-800/60" />
-                  </li>
-                ))
-              ) : rankedPeople.length === 0 ? (
-                <li className="text-sm text-neutral-400">No calls match these filters.</li>
-              ) : (
-                rankedPeople.slice(0, 12).map((person, index) => {
-                  const primaryMetric =
-                    rankingMode === "duration"
-                      ? formatDuration(person.totalDuration)
-                      : rankingMode === "calls"
-                        ? formatNumber(person.calls)
-                        : rankingMode === "outgoing"
-                          ? formatNumber(person.outgoing)
-                          : formatNumber(person.missedIncoming);
-                  const secondary =
-                    rankingMode === "duration"
-                      ? `${formatNumber(person.calls)} call${person.calls === 1 ? "" : "s"}`
-                      : rankingMode === "calls"
-                        ? `${formatDuration(person.totalDuration)} talk time`
-                        : rankingMode === "outgoing"
-                          ? `${formatNumber(person.calls)} total · ${formatNumber(person.incoming)} incoming`
-                          : person.incoming > 0
-                            ? `${Math.round((person.missedIncoming / person.incoming) * 100)}% missed · ${formatNumber(person.incoming)} incoming`
-                            : `${formatNumber(person.calls)} total`;
-                  const last = person.lastCallAt
-                    ? person.lastCallAt.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
-                    : "—";
-                  return (
-                    <li
-                      key={person.key}
-                      className="rounded-xl border border-neutral-800/70 bg-neutral-950/40 p-0 transition hover:border-neutral-700"
-                    >
-                      <button
-                        type="button"
-                        onClick={() => setSelectedPersonKey(person.key)}
-                        className="w-full p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-                      >
-                        <div className="flex items-center justify-between gap-4">
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-neutral-50">
-                              <span className="mr-2 text-xs font-semibold text-neutral-500">#{index + 1}</span>
-                              {person.label}
-                            </p>
-                            <p className="mt-1 text-xs text-neutral-400">
-                              {secondary} · {formatNumber(person.answered)} answered · {formatNumber(person.missedIncoming)} missed (in) · last {last}
-                            </p>
-                          </div>
-                          <div className="shrink-0 text-right">
-                            <p className="text-sm font-semibold text-emerald-200">{primaryMetric}</p>
-                            <p className="mt-1 text-xs text-neutral-500">{person.incoming} in · {person.outgoing} out</p>
-                          </div>
-                        </div>
-                      </button>
-                    </li>
-                  );
-                })
-              )}
-            </ul>
-          </div>
-
-          <div className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Daily calls</p>
-                <p className="mt-1 text-sm text-neutral-300">Last 30 days (current filters).</p>
-              </div>
-              <span className="text-xs text-neutral-500">Count</span>
-            </div>
-
-            <div className="mt-4 space-y-2">
-              {callsQuery.isPending ? (
-                Array.from({ length: 10 }).map((_, index) => (
-                  <div key={`day-skel-${index}`} className="flex items-center gap-3">
-                    <div className="h-3 w-20 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="h-2 flex-1 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="h-3 w-10 animate-pulse rounded bg-neutral-800/60" />
-                  </div>
-                ))
-              ) : dailyBuckets.length === 0 ? (
-                <p className="text-sm text-neutral-400">No calls in the last 30 days for this view.</p>
-              ) : (
-                dailyBuckets.slice(-14).map((bucket) => {
-                  const width = dailyMax ? Math.max(4, (bucket.count / dailyMax) * 100) : 0;
-                  const label = bucket.date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-                  return (
-                    <div key={bucket.date.toISOString()} className="flex items-center gap-3">
-                      <span className="w-20 text-xs text-neutral-400">{label}</span>
-                      <div className="h-2 flex-1 rounded-full bg-neutral-900">
-                        <div className="h-full rounded-full bg-sky-400/80" style={{ width: `${width}%` }} />
-                      </div>
-                      <span className="w-10 text-right text-xs font-semibold text-neutral-200">{bucket.count}</span>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section className="rounded-2xl border border-neutral-800/70 bg-neutral-950/40 p-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">Recent calls</p>
-              <p className="mt-1 text-sm text-neutral-300">
-                Showing {formatNumber(Math.min(filteredCalls.length, recentLimit))} of {formatNumber(filteredCalls.length)} calls.
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {hasMoreRecent ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setRecentLimit((value) => Math.min(filteredCalls.length, value + 50))}
-                    className="rounded-full border border-neutral-800/80 bg-neutral-900/70 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
-                  >
-                    Show more
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setRecentLimit(filteredCalls.length)}
-                    className="rounded-full border border-neutral-800/80 bg-neutral-900/70 px-3 py-1 text-xs font-semibold text-neutral-200 transition hover:border-neutral-700 hover:text-white"
-                  >
-                    Show all
-                  </button>
-                </>
-              ) : null}
-              <span className="text-xs text-neutral-500">Duration</span>
-            </div>
-          </div>
-
-          <div className="mt-4 divide-y divide-neutral-900/60 overflow-hidden rounded-xl border border-neutral-900/60">
-            {callsQuery.isPending ? (
-              Array.from({ length: 8 }).map((_, index) => (
-                <div key={`recent-skel-${index}`} className="flex items-center gap-3 bg-neutral-950/40 px-4 py-3">
-                  <div className="h-8 w-8 animate-pulse rounded-full bg-neutral-800/60" />
-                  <div className="flex-1 space-y-2">
-                    <div className="h-3 w-1/3 animate-pulse rounded bg-neutral-800/60" />
-                    <div className="h-3 w-1/2 animate-pulse rounded bg-neutral-800/60" />
-                  </div>
-                  <div className="h-3 w-16 animate-pulse rounded bg-neutral-800/60" />
-                </div>
-              ))
-            ) : recentCalls.length === 0 ? (
-              <div className="bg-neutral-950/40 px-4 py-6 text-sm text-neutral-400">No calls found.</div>
+          <div className="mt-3 flex flex-col gap-0.5">
+            {topPeople.length === 0 ? (
+              <EmptyNote className="py-4">No people match this ranking in the current view.</EmptyNote>
             ) : (
-              recentCalls.map((call) => {
-                const startedAt = parseDate(call.startedAt);
-                const when = startedAt
-                  ? startedAt.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
-                  : "Unknown time";
-                const icon =
-                  call.provider === "facetime" && call.media === "video" ? (
-                    <VideoIcon className="h-4 w-4 text-violet-200" />
-                  ) : call.provider === "facetime" ? (
-                    <PhoneIcon className="h-4 w-4 text-violet-200" />
-                  ) : (
-                    <PhoneIcon className="h-4 w-4 text-sky-200" />
-                  );
-
-                const participants = call.participants.length
-                  ? call.participants.map(getParticipantLabel)
-                  : call.name
-                    ? [call.name]
-                    : call.address
-                      ? [call.address]
-                      : ["Unknown"];
-
-                const outcomeTone = call.answered ? "text-emerald-200" : "text-amber-200";
-                const directionLabel =
-                  call.direction === "incoming" ? "Incoming" : call.direction === "outgoing" ? "Outgoing" : "Unknown";
-
+              topPeople.map((person, index) => {
+                const metric = personMetric(person, rankingMode);
+                const primary = rankingMode === "duration" ? formatDuration(metric) : formatCount(metric);
                 return (
-                  <div key={call.callId} className="flex items-center gap-4 bg-neutral-950/40 px-4 py-3">
-                    <div className="flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/5">
-                      {icon}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                        <p className="truncate text-sm font-semibold text-neutral-50">
-                          {participants.join(", ")}
-                        </p>
-                        <span className={`text-xs font-semibold ${outcomeTone}`}>
-                          {call.answered ? "Answered" : "Missed"}
+                  <Link
+                    key={person.key}
+                    href={personHref(person)}
+                    className="flex items-center gap-[13px] rounded-xl px-2 py-[9px] transition-colors hover:bg-surface"
+                  >
+                    <span className="w-4 flex-none font-mono text-[11px] text-ink-ghost">{index + 1}</span>
+                    <Avatar label={person.label} identityKey={person.key} size={34} />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-baseline justify-between gap-2.5">
+                        <span className="truncate text-[13px] font-semibold text-ink-primary">{person.label}</span>
+                        <span className="flex-none font-mono text-[11px] text-accent-soft">{primary}</span>
+                      </span>
+                      <span className="mt-1.5 flex items-center gap-2">
+                        <span className="flex-1">
+                          <MeterBar
+                            ratio={share(metric, topPeopleMax)}
+                            color="linear-gradient(90deg,var(--accent),var(--sky))"
+                            delay={index * 0.04}
+                          />
                         </span>
-                        <span className="text-xs text-neutral-500">{directionLabel}</span>
-                        <span className="text-xs text-neutral-500">{call.provider === "facetime" ? "FaceTime" : "Phone"}</span>
-                        {call.media !== "unknown" ? (
-                          <span className="text-xs text-neutral-500">{call.media}</span>
-                        ) : null}
-                      </div>
-                      <p className="mt-1 text-xs text-neutral-400">{when}</p>
-                    </div>
-                    <div className="shrink-0 text-right">
-                      <p className="text-sm font-semibold text-neutral-100">{formatDuration(call.durationSeconds)}</p>
-                    </div>
-                  </div>
+                        <span className="flex-none whitespace-nowrap font-mono text-[10px] text-ink-ghost">
+                          {formatCount(person.calls)} {person.calls === 1 ? "call" : "calls"} ·{" "}
+                          {formatCount(person.incoming)} in / {formatCount(person.outgoing)} out
+                        </span>
+                      </span>
+                    </span>
+                  </Link>
                 );
               })
             )}
           </div>
-        </section>
-      </main>
+        </Panel>
 
-      <PersonDrawer
-        open={Boolean(selectedPersonKey)}
-        onClose={() => setSelectedPersonKey(null)}
-        person={selectedPerson}
-        messages={selectedMessageStats}
-        calls={selectedCallStats}
-        rangeStartIso={range.startIso}
-        rangeEndIso={range.endIso}
-        callHistoryEarliest={callHistoryEarliest}
-        isMessagesLoading={messagesQuery.isPending || messagesQuery.isFetching}
-        isCallsLoading={callsQuery.isPending || callsQuery.isFetching}
-        messagesError={messagesError}
-        callsError={accessError}
-      />
-    </div>
+        <Panel delay={0.42} className="rounded-[20px] px-[22px] py-5">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <PanelTitle>Daily calls</PanelTitle>
+              <PanelSubtitle>
+                {rangeLabel}
+                {daysPerBar > 1 ? ` · ${daysPerBar}d per bar` : null}
+              </PanelSubtitle>
+            </div>
+            {barPeak > 0 ? (
+              <span className="flex-none font-mono text-[11px] text-sky">peak {formatCount(barPeak)}</span>
+            ) : null}
+          </div>
+
+          {bars.length === 0 ? (
+            <EmptyNote className="mt-4">No dated calls in this range.</EmptyNote>
+          ) : (
+            <>
+              <div className="mt-4 flex h-[150px] items-end gap-[3px]">
+                {bars.map((bar, index) => {
+                  const ratio = barPeak > 0 ? bar.count / barPeak : 0;
+                  return (
+                    <div
+                      key={`${bar.label}-${index}`}
+                      className="flex h-full flex-1 flex-col justify-end"
+                      title={`${bar.label}${bar.days > 1 ? ` +${bar.days - 1}d` : ""} · ${bar.count} calls`}
+                    >
+                      <div
+                        className="w-full origin-bottom rounded-[2px] animate-bar"
+                        style={{
+                          height: bar.count > 0 ? `${Math.max(4, ratio * 100)}%` : "2px",
+                          background: bar.count > 0 ? "var(--sky)" : "var(--track)",
+                          opacity: bar.count > 0 ? (ratio > 0.85 ? 1 : ratio > 0.5 ? 0.6 : 0.28) : 1,
+                          animationDelay: `${Math.min(index * 0.015, 0.6)}s`,
+                        }}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+              <AxisLabels labels={[bars[0].label, bars[bars.length - 1].label]} className="mt-2.5" />
+            </>
+          )}
+        </Panel>
+      </div>
+
+      {/* Recent calls */}
+      <Panel delay={0.46} className="rounded-[20px] px-[22px] py-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <PanelTitle>Recent calls</PanelTitle>
+            <PanelSubtitle>
+              Showing {formatCount(recentCalls.length)} of {formatCount(filteredCalls.length)}
+            </PanelSubtitle>
+          </div>
+          {hasMoreRecent ? (
+            <div className="flex items-center gap-2">
+              <PagerButton onClick={() => setRecentLimit((value) => Math.min(filteredCalls.length, value + 50))}>
+                Show more
+              </PagerButton>
+              <PagerButton onClick={() => setRecentLimit(filteredCalls.length)}>Show all</PagerButton>
+            </div>
+          ) : recentLimit > 50 ? (
+            <PagerButton onClick={() => setRecentLimit(50)}>Show less</PagerButton>
+          ) : null}
+        </div>
+
+        <div className="mt-3.5 divide-y divide-line-hairline overflow-hidden rounded-[14px] border border-line-subtle">
+          {recentCalls.map((call) => {
+            const target = participantsOf(call)[0];
+            const label = callTargets(call);
+            const kind = [providerLabel(call.provider), mediaLabel(call.media)].filter(Boolean).join(" · ");
+            const duration = durationOf(call);
+            return (
+              <div key={call.callId} className="flex items-center gap-3.5 bg-inset px-4 py-[13px]">
+                <Avatar label={label} identityKey={target?.id ?? target?.handle ?? label} size={34} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                    <span className="truncate text-[13px] font-semibold text-ink-primary">{label}</span>
+                    <span
+                      className={`text-[11px] font-semibold ${call.answered ? "text-accent" : "text-amber"}`}
+                    >
+                      {call.answered ? "Answered" : call.outcome === "missed" ? "Missed" : "No answer"}
+                    </span>
+                    <span className="text-[11px] text-ink-ghost">{directionLabel(call.direction)}</span>
+                    {kind ? <span className="text-[11px] text-ink-ghost">{kind}</span> : null}
+                  </div>
+                  <p className="mt-1 text-[11px] text-ink-faint">
+                    {call.startedAt ? formatDateTime(call.startedAt) : "Unknown time"}
+                  </p>
+                </div>
+                <span className="flex-none font-mono text-[13px] font-semibold text-ink-secondary">
+                  {duration > 0 ? formatDuration(duration) : "—"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </Panel>
+    </>
   );
 }
